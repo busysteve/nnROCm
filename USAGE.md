@@ -1,0 +1,1219 @@
+# Usage
+
+This is the programmer's guide for the ROCm tree, nnROCm. The types are the same C++17 API as [nnCUDA](https://github.com/busysteve/nnCUDA) and [nnCL](https://github.com/busysteve/nnCL). Every type lives in a header under `include/nn/`. Those headers are plain C++17. Build steps, numeric details, the checkpoint byte layout, and the MNIST suite are in [README.md](README.md).
+
+Link the CMake target `nn`. It carries `roc::hipblas` and `roc::rocblas`. A program that links `libnn.a` by hand also links hipBLAS and rocBLAS.
+
+Create one `Context` on the HIP device you want, then create tensors, layers, and the optimizer from that context. Destroy those objects before the context. The context uses the device that is current when it is constructed, and it owns one stream. `synchronize()` waits for that stream.
+
+Storage is dense float32. A rank-2 tensor is `(N, F)`, row-major. A rank-3 tensor is `(N, T, F)`, with the feature index contiguous. A rank-4 tensor is `(N, C, H, W)`, NCHW. `forward` and `backward` return a `const Tensor&` into storage owned by that layer. The reference stays valid until the next `forward` or `backward` on the same layer, or until the layer is destroyed. Keep values with `to_host()` or `copy_from`.
+
+`NamedParam` and `NamedBuffer` hold raw pointers into those tensors. `parameters()` and `buffers()` return a fresh vector of pointers. The storage lives as long as the owning layer does. `Sgd` copies the pointers and owns one velocity tensor per parameter. `AdamW` copies them in groups and owns a first and second moment per parameter.
+
+Library failures throw `nn::Error`. Config checks throw `std::invalid_argument` whose message is the field name.
+
+## Train one batch
+
+```cpp
+#include "nn/builders.hpp"
+#include "nn/loss.hpp"
+
+nn::Context ctx;
+
+nn::MlpConfig config;
+config.input_size = 784;
+config.hidden = {256, 128};
+config.output_size = 10;
+
+nn::Network net = nn::build_mlp(ctx, config, /*seed=*/1);
+nn::Sgd optimizer(net.parameters(), /*learning_rate=*/0.1f, /*momentum=*/0.9f);
+
+nn::Tensor input(ctx, {128, 784});
+nn::DeviceIndices labels(ctx, 128);
+// Fill input with copy_from_host, and labels with copy_from_host.
+
+net.train();
+net.zero_grad();
+const nn::Tensor& logits = net.forward(input);
+nn::LossResult loss = nn::softmax_cross_entropy(ctx, logits, labels);
+net.backward(loss.grad_logits);
+optimizer.step();
+
+net.eval();
+net.save("mlp.bin", nullptr);
+```
+
+Weight and bias gradients accumulate. Call `zero_grad` once per step. A new network is in train mode. Call `eval()` before inference when the network contains batch-norm or dropout.
+
+For an image network, `input` is rank 4: `(N, in_channels, in_height, in_width)`. For a recurrent network, `input` is rank 3: `(N, T, input_size)`. `build_rnn` returns logits of shape `(N, output_size)`. For a transformer trunk, `input` is a float tensor `(N, T, d_model)`. `build_transformer_network` returns `(N, T, vocab_size)`.
+
+## Error
+
+Header: `nn/error.hpp`
+
+```cpp
+class Error : public std::runtime_error {
+ public:
+  explicit Error(const std::string& message);
+};
+```
+
+Catch `nn::Error` for a failed HIP or hipBLAS call, a bad tensor or layer argument, or a checkpoint problem. The message for a runtime status is `call: STATUS_NAME`, for example `hipblasGemmEx: HIPBLAS_STATUS_NOT_SUPPORTED` or `hipMalloc: hipErrorOutOfMemory`. Catch `std::invalid_argument` when `validate` or `conv_out_size` rejects a config field.
+
+## Context
+
+Header: `nn/context.hpp`
+
+```cpp
+class Context {
+ public:
+  Context();
+  explicit Context(int device);
+  explicit Context(const std::string& choice);
+  void synchronize() const;
+};
+
+struct DeviceInfo {
+  int index;
+  std::string name;
+};
+
+int device_count();
+std::string device_name(int device);
+std::vector<DeviceInfo> detect_devices();
+int select_device(const std::string& choice);
+```
+
+`Context` is neither copyable nor movable. `Context()` creates the stream and the hipBLAS handle on the current device and does not call `hipSetDevice`. `Context(int device)` calls `hipSetDevice` first. `device_count()` is the number of visible HIP devices, and `device_name` is that device's name. An index outside `0 .. device_count()-1` throws `device`. `detect_devices()` returns those devices in index order. `select_device("auto")` is the first one. `select_device("1")` is manual. `Context(choice)` uses that result and calls `hipSetDevice`. A blank choice, a word other than `auto`, or an index past the list throws `device`. Pass the same `Context&` to every tensor, label buffer, layer, and loss that must share that stream. `data()` is a HIP device pointer.
+
+`synchronize()` waits until work queued on that stream has finished. `Tensor::to_host()`, `kaiming_normal`, and `normal_` synchronize for you. `copy_from_host` queues an async copy, so call `synchronize()` before reusing the host buffer.
+
+## Tensor
+
+Header: `nn/tensor.hpp`
+
+```cpp
+class Tensor {
+ public:
+  Tensor(Context& ctx, std::vector<int> shape);
+  Context& context() const;
+  int rank() const;
+  const std::vector<int>& shape() const;
+  int64_t numel() const;
+  float* data();
+  const float* data() const;
+
+  void zero();
+  void fill(float value);
+  void scale(float factor);
+  void copy_from(const Tensor& src);
+  void copy_from_host(const float* src, int64_t n);
+  void copy_from_host(const std::vector<float>& src);
+  std::vector<float> to_host() const;
+  Tensor reshape(const std::vector<int>& shape) const;
+};
+```
+
+`Tensor` is movable and not copyable. The constructor allocates device memory with `hipMalloc`. Fresh memory is uninitialized. Call `zero`, `fill`, or `copy_from_host` before a read.
+
+The shape has rank 1, 2, 3, or 4. Every dimension is at least 1. The element count must fit in a signed 32-bit integer. A bad rank throws `tensor rank out of range`. A bad dimension throws `tensor dimension out of range`. An overflowing product throws `tensor numel out of range`.
+
+`data()` is a device pointer. Kernels that use it run on `context()`'s stream.
+
+`copy_from` requires the same element count and throws `tensor copy numel mismatch` otherwise. A source on another context is synchronized before the copy. `copy_from_host` throws `tensor host copy numel mismatch` when `n` or `src.size()` differs from `numel()`.
+
+`to_host()` synchronizes, then copies the tensor to a `std::vector<float>`.
+
+`scale(factor)` multiplies every element in place on the context stream. It does not synchronize.
+
+`reshape` checks that the new shape has the same element count, allocates a new tensor on the same context, and copies. It throws `tensor reshape numel mismatch` when the counts differ.
+
+The destructor synchronizes the stream and frees the device memory.
+
+## DeviceIndices
+
+Header: `nn/loss.hpp`
+
+```cpp
+class DeviceIndices {
+ public:
+  DeviceIndices(Context& ctx, int64_t n);
+  void copy_from_host(const int64_t* src, int64_t n);
+  const int64_t* data() const;
+  int64_t size() const;
+  Context& context() const;
+};
+```
+
+`DeviceIndices` is the label buffer for `softmax_cross_entropy`. It is movable and not copyable. `n` is the batch size and must be positive. `n <= 0` throws `empty labels`. Values are `int64` class indices on the device. `copy_from_host` requires `n == size()` and throws `label count mismatch` otherwise. The destructor synchronizes and frees the buffer.
+
+## IndexTensor
+
+Header: `nn/index_tensor.hpp`
+
+```cpp
+class IndexTensor {
+ public:
+  IndexTensor(Context& ctx, std::vector<int> shape);
+  void copy_from_host(const int64_t* src, int64_t n);
+  std::vector<int64_t> to_host() const;
+  const int64_t* data() const;
+  const std::vector<int>& shape() const;
+  int64_t numel() const;
+  Context& context() const;
+};
+```
+
+`IndexTensor` is a dense `int64` index buffer for `Embedding`. It is movable and not copyable. It is not a float `Tensor`. `DeviceIndices` stays the rank-1 label buffer for `softmax_cross_entropy`.
+
+The shape has rank 1 `(N,)` or rank 2 `(N, T)`. Every dimension is at least 1. The element count must fit in a signed 32-bit integer. A bad rank throws `index tensor rank out of range`. A bad dimension throws `index tensor dimension out of range`. An overflowing product throws `index tensor numel out of range`.
+
+`data()` is a device pointer. `copy_from_host` queues an async copy and throws `index tensor host copy numel mismatch` when `n` differs from `numel()`. Call `context().synchronize()` before reusing the host buffer. `to_host()` synchronizes, then copies the indices to a `std::vector<int64_t>`. The destructor synchronizes the stream and frees the device memory. Destroy the index tensor before its context.
+
+## LossResult
+
+Header: `nn/loss.hpp`
+
+```cpp
+struct LossResult {
+  float loss = 0.f;
+  Tensor grad_logits;
+};
+
+LossResult softmax_cross_entropy(Context& ctx, const Tensor& logits, const DeviceIndices& labels);
+```
+
+`logits` is rank 2, shape `(N, C)`, with `C > 1`. `labels.size()` equals `N`. Each label is in `[0, C)`. The returned `loss` is the mean softmax cross-entropy over the batch. `grad_logits` has the same shape as `logits` and holds `(softmax - one_hot) / N`. Pass that tensor to `backward`.
+
+| Condition | Message |
+|---|---|
+| Rank other than 2 | `logits rank` |
+| `N <= 0` or `C <= 1` | `logits shape` |
+| Label count differs from `N` | `label count mismatch` |
+| A label outside `[0, C)` | `label out of range` |
+
+`LossResult` owns `grad_logits`. It is movable and not copyable.
+
+## Sequence cross-entropy
+
+Header: `nn/loss.hpp`
+
+```cpp
+LossResult sequence_cross_entropy(Context& ctx, const Tensor& logits, const IndexTensor& labels,
+                                  int64_t ignore_index = -100);
+```
+
+Mean softmax cross-entropy over a sequence. `logits` is `(N, T, V)` with `labels` `(N, T)`, or `logits` is `(rows, V)` with `labels` `(rows,)`. `V > 1`. Labels are already aligned with the logits. This function does not shift tokens. `grad_logits` has the same shape as `logits`.
+
+A label equal to `ignore_index` is left out of the mean, and that row of `grad_logits` is zero. The default `ignore_index` is `-100`. Any other label outside `[0, V)` throws `label out of range`. The mean and the gradients divide by the number of labels that were kept. If every label is ignored, the loss is `0`, `grad_logits` is all zeros, and the function does not divide by zero.
+
+`softmax_cross_entropy` is unchanged. It still rejects every negative label, including `-100`.
+
+| Condition | Message |
+|---|---|
+| Rank other than 2 or 3 | `logits rank` |
+| `V <= 1` | `logits shape` |
+| Label rank or dimensions do not match `logits` | `label shape` |
+| A label other than `ignore_index` outside `[0, V)` | `label out of range` |
+
+## NamedParam and NamedBuffer
+
+Header: `nn/layer.hpp`
+
+```cpp
+struct NamedParam {
+  std::string name;
+  Tensor* value = nullptr;
+  Tensor* grad = nullptr;
+};
+
+struct NamedBuffer {
+  std::string name;
+  Tensor* value = nullptr;
+  uint64_t* batches = nullptr;
+};
+```
+
+A parameter is a trainable tensor plus its gradient. A buffer is state that is saved and restored and is left alone by `zero_grad` and by `Sgd`. `batches` points at the batch-norm counter shared by that layer's `running_mean` and `running_var`.
+
+`Layer::parameters()` returns names local to the layer, such as `weight` and `bias`. `Network::parameters()` prefixes the layer name. A layer named `fc.0` contributes `fc.0.weight` and `fc.0.bias`. An empty layer name contributes the local name unchanged. `ResidualBlock` prefixes its children first, so a block named `stages.0.blocks.1` contributes `stages.0.blocks.1.conv1.weight`. `TransformerBlock` prefixes the same way (`ln1.`, `attn.`, `ln2.`, `fc1.`, `fc2.`).
+
+## Layer
+
+Header: `nn/layer.hpp`
+
+```cpp
+class Layer {
+ public:
+  virtual const Tensor& forward(const Tensor& input) = 0;
+  virtual const Tensor& backward(const Tensor& grad_output) = 0;
+  virtual std::vector<NamedParam> parameters() const = 0;
+  virtual std::vector<NamedBuffer> buffers() const;
+  virtual void zero_grad() = 0;
+  virtual void set_training(bool);
+
+  const std::string& name() const;
+  void set_name(std::string name);
+};
+```
+
+`Layer` is the abstract base. Construct a concrete layer with a `Context`, then call `forward` and `backward` yourself or hand ownership to a `Network` with `std::unique_ptr<Layer>`. `set_name` before the network is built. `buffers()` defaults to an empty list. `set_training` defaults to a no-op. `BatchNorm2d`, `Dropout`, `ResidualBlock`, and `TransformerBlock` honor it. `LayerNorm` and `RMSNorm` ignore it: train and eval use the same math.
+
+`backward` reads the activation saved by the matching `forward`. Call `forward` on that layer before `backward`.
+
+### Linear
+
+Header: `nn/layers/linear.hpp`
+
+```cpp
+Linear(Context& ctx, int in_features, int out_features, std::mt19937& rng);
+Linear(Context& ctx, int in_features, int out_features, bool use_bias, std::mt19937& rng);
+```
+
+The three-argument constructor calls the four-argument constructor with `use_bias` true.
+
+`in_features` and `out_features` are at least 1. A smaller value throws `Linear size`. The constructor draws `weight` with `kaiming_normal` and fan-in `in_features`. When `use_bias` is true, `bias` starts at zero. The weight draw uses `rng`. The bias fill consumes no random numbers.
+
+| Tensor | Shape | Name |
+|---|---|---|
+| weight | `(out_features, in_features)` | `weight` |
+| bias, when `use_bias` | `(out_features)` | `bias` |
+
+`forward` takes rank 2 `(N, in_features)` or rank 3 `(N, T, in_features)` and returns `(N, out_features)` or `(N, T, out_features)`:
+
+```
+y = x * W^T + b
+```
+
+When `use_bias` is false, `b` is omitted. Rank 3 keeps shape `(N, T, F)`. The matrix product uses `N * T` rows on the input pointer, with the same leading dimensions as rank 2.
+
+A rank other than 2 or 3, or a feature count other than `in_features`, throws `Linear input shape`. `backward` takes a gradient of the forward output shape, returns the input shape, and adds into `grad_weight` and, when bias is on, `grad_bias`. A mismatched gradient throws `Linear backward shape`.
+
+### Embedding
+
+Header: `nn/layers/embedding.hpp`
+
+```cpp
+Embedding(Context& ctx, int num_embeddings, int embedding_dim, std::mt19937& rng);
+const Tensor& forward_indices(const IndexTensor& indices);
+```
+
+`num_embeddings` and `embedding_dim` are at least 1. A smaller value throws `Embedding size`. The constructor draws `weight` with `normal_` at mean 0 and standard deviation 0.02. There is no padding index. Pass an index tensor from the same context (`Embedding context`).
+
+| Tensor | Shape | Name |
+|---|---|---|
+| weight | `(num_embeddings, embedding_dim)` | `weight` |
+
+`forward(const Tensor&)` throws `Embedding requires indices`. Call `forward_indices` instead.
+
+`forward_indices` reads rank 1 `(N,)` or rank 2 `(N, T)` and returns `(N, embedding_dim)` or `(N, T, embedding_dim)`. It copies the ids and checks them on the host before the gather, which synchronizes. Each id must be in `[0, num_embeddings)`. An id outside that range throws `index out of range` and leaves the previous ids in place. The output row is `weight[id]`.
+
+`backward` takes a gradient of that output shape and scatter-adds it into `grad_weight`. Duplicate ids in one batch accumulate. `backward` does not clear `grad_weight`; call `zero_grad` first. A call without a successful `forward_indices` throws `Embedding backward without forward`. A mismatched gradient throws `Embedding backward shape`. Token ids are not differentiable, so the returned tensor has the same shape as `grad_output` and is filled with zeros. The reference is owned by the layer.
+
+### ReLU
+
+Header: `nn/layers/relu.hpp`
+
+```cpp
+explicit ReLU(Context& ctx);
+```
+
+No parameters. `forward` and `backward` accept rank 2, rank 3, or rank 4 and return the same shape. Any other rank throws `ReLU rank`. Forward is `y = max(x, 0)`. Backward passes the gradient through where `x > 0`. `backward` requires the gradient shape to match the saved forward output and throws `ReLU backward shape` otherwise. `zero_grad` is empty.
+
+### GELU
+
+Header: `nn/layers/gelu.hpp`
+
+```cpp
+explicit GELU(Context& ctx);
+```
+
+No parameters. `forward` and `backward` accept rank 2, rank 3, or rank 4 and return the same shape. Any other rank throws `GELU rank`.
+
+```
+GELU(x) = 0.5 * x * (1 + erf(x / sqrt(2)))
+```
+
+`forward` stores the input. `backward` multiplies the incoming gradient by `Φ(x) + x φ(x)`, where `Φ` is the standard normal CDF and `φ` is its density. A gradient whose shape differs from the saved input throws `GELU backward shape`. `zero_grad` is empty.
+
+### SwiGLU
+
+Header: `nn/layers/swiglu.hpp`
+
+```cpp
+explicit SwiGLU(Context& ctx);
+```
+
+No parameters. Rank 2 `(N, 2F)` returns `(N, F)`. Rank 3 `(N, T, 2F)` returns `(N, T, F)`. Rank 4 `(N, 2C, H, W)` returns `(N, C, H, W)`. Rank 2 and rank 4 split dimension 1. Rank 3 splits the last dimension. The first half is the gate `a` and the second half is the value `b`:
+
+```
+y = SiLU(a) * b
+SiLU(a) = a * sigmoid(a)
+```
+
+Any other rank throws `SwiGLU rank`. An odd size on the split dimension throws `SwiGLU size`. `forward` stores the input. `backward` returns the input shape. A gradient whose shape differs from the forward output throws `SwiGLU backward shape`. `zero_grad` is empty.
+
+### RNN
+
+Header: `nn/layers/rnn.hpp`
+
+```cpp
+RNN(Context& ctx, int input_size, int hidden_size, std::mt19937& rng);
+```
+
+`input_size` and `hidden_size` are at least 1. A smaller value throws `RNN size`. `weight_ih` is drawn with fan-in `input_size`. `weight_hh` is drawn with fan-in `hidden_size`. Both biases start at zero and consume no random numbers.
+
+| Tensor | Shape | Name |
+|---|---|---|
+| weight_ih | `(hidden_size, input_size)` | `weight_ih` |
+| weight_hh | `(hidden_size, hidden_size)` | `weight_hh` |
+| bias_ih | `(hidden_size)` | `bias_ih` |
+| bias_hh | `(hidden_size)` | `bias_hh` |
+
+`forward` takes `(N, T, input_size)` and returns `(N, T, hidden_size)`. The hidden state before step 0 is zero.
+
+```
+h_t = tanh(x_t * W_ih^T + b_ih + h_{t-1} * W_hh^T + b_hh)
+```
+
+A rank other than 3, or a feature count other than `input_size`, throws `RNN input shape`. `backward` walks the sequence from the last step to the first, returns `(N, T, input_size)`, and adds into all four gradients. A gradient whose shape differs from the forward output, including a backward with no forward, throws `RNN backward shape`.
+
+### LastStep
+
+Header: `nn/layers/last_step.hpp`
+
+```cpp
+class LastStep : public Layer { /* default constructor */ };
+```
+
+No parameters. `forward` takes `(N, T, F)` and returns `(N, F)`, the values at time `T - 1`. A rank other than 3 throws `LastStep input rank`. `backward` writes the incoming gradient into that last step and leaves every earlier step at zero. Call `forward` first. A backward with no forward throws `LastStep backward without forward`. A mismatched gradient throws `LastStep backward shape`. `zero_grad` is empty.
+
+### Conv2d
+
+Header: `nn/layers/conv2d.hpp`
+
+```cpp
+Conv2d(Context& ctx, int in_channels, int out_channels, int kernel, int stride, int pad,
+       bool use_bias, std::mt19937& rng);
+```
+
+The kernel is square. `in_channels` and `out_channels` are at least 1 (`Conv2d channels`). `kernel` and `stride` are at least 1, and `pad` is at least 0. A failed size check throws `std::invalid_argument` with message `kernel`, `stride`, or `pad`.
+
+Weight shape is `(out_channels, in_channels, kernel, kernel)`. Fan-in is `in_channels * kernel * kernel`. Bias, when `use_bias` is true, has shape `(out_channels)` and starts at zero. Parameter names are `weight`, then `bias` when bias is on.
+
+`forward` takes `(N, in_channels, H, W)` and returns `(N, out_channels, H_out, W_out)`, where
+
+```
+H_out = (H + 2 * pad - kernel) / stride + 1
+```
+
+and the same formula gives `W_out`. Integer division truncates. A non-positive result throws `std::invalid_argument` with message `spatial`. A rank other than 4, or a channel count other than `in_channels`, throws `Conv2d input shape`.
+
+The convolution is cross-correlation, dilation 1, groups 1. The first call at a given spatial size allocates one workspace, at most 64 MiB. A larger request throws `conv workspace <bytes> exceeds 64 MiB budget`. A later shape that needs more memory frees and reallocates.
+
+`backward` accumulates `grad_weight` and, when bias is on, `grad_bias`. The gradient's shape matches the forward output. A mismatch throws `Conv2d backward shape`.
+
+### MaxPool2d
+
+Header: `nn/layers/max_pool2d.hpp`
+
+```cpp
+MaxPool2d(Context& ctx, int kernel, int stride);
+```
+
+The window is square and the padding is 0. `kernel` and `stride` are at least 1. Output height and width use `conv_out_size` with pad 0. `forward` takes rank 4 and returns `(N, C, H_out, W_out)`. A rank other than 4 throws `MaxPool2d input rank`. A gradient whose shape differs from the forward output throws `MaxPool2d backward shape`. There are no parameters. `zero_grad` is empty.
+
+### BatchNorm2d
+
+Header: `nn/layers/batch_norm2d.hpp`
+
+```cpp
+BatchNorm2d(Context& ctx, int channels);
+```
+
+`channels` is at least 1 (`BatchNorm2d channels`). The layer owns scale and shift parameters and the running statistics.
+
+| Tensor | Shape | Name | Initial value |
+|---|---|---|---|
+| weight (scale) | `(channels)` | `weight` | 1 |
+| bias (shift) | `(channels)` | `bias` | 0 |
+| running mean | `(channels)` | `running_mean` | 0 |
+| running variance | `(channels)` | `running_var` | 1 |
+
+The batch counter starts at 0. `parameters()` returns `weight` and `bias`. `buffers()` returns `running_mean` and `running_var`. Both buffers share the counter through `NamedBuffer::batches`.
+
+`forward` takes `(N, channels, H, W)` and returns the same shape. A rank other than 4, or a channel mismatch, throws `BatchNorm2d input shape`. The mode is spatial and epsilon is `1e-5`.
+
+In train mode the layer requires `N * H * W > 1`. A smaller count throws `BatchNorm train mode needs more than one value per channel`. Each train forward increments the counter, then updates the running statistics with factor `1 / batches`. Eval forward uses the stored mean and variance and leaves them unchanged.
+
+`backward` runs in train mode and adds into the scale and shift gradients. Eval mode throws `BatchNorm backward requires train mode`. A missing forward or a mismatched gradient throws `BatchNorm2d backward shape`.
+
+`set_training(true)` selects train mode. `set_training(false)` selects eval mode. `Network::train` and `Network::eval` call `set_training` on every layer.
+
+### LayerNorm
+
+Header: `nn/layers/layer_norm.hpp`
+
+```cpp
+LayerNorm(Context& ctx, int normalized_shape, float eps = 1e-5f);
+```
+
+`normalized_shape` is at least 1 (`LayerNorm size`). `eps` is finite and greater than 0 (`LayerNorm eps`). The default is `1e-5`.
+
+`weight` (gamma) has shape `(normalized_shape)` and starts at 1. `bias` (beta) has the same shape and starts at 0. Names are `weight` and `bias`. There are no buffers. `set_training` does not change the result.
+
+`forward` accepts rank 2 `(N, normalized_shape)` or rank 3 `(N, T, normalized_shape)` and returns the same shape. Mean and variance are over the last dimension. Variance is the mean of squared deviations, divided by `normalized_shape`, not `normalized_shape - 1`:
+
+```
+y = (x - mean) / sqrt(var + eps) * weight + bias
+```
+
+A rank other than 2 or 3, or a last dimension other than `normalized_shape`, throws `LayerNorm input shape`. `backward` returns the input shape and adds into `grad_weight` and `grad_bias`. A missing forward or a mismatched gradient throws `LayerNorm backward shape`.
+
+### RMSNorm
+
+Header: `nn/layers/rms_norm.hpp`
+
+```cpp
+RMSNorm(Context& ctx, int normalized_shape, float eps = 1e-5f);
+```
+
+`normalized_shape` is at least 1 (`RMSNorm size`). `eps` is finite and greater than 0 (`RMSNorm eps`). The default is `1e-5`.
+
+`weight` has shape `(normalized_shape)` and starts at 1. There is no bias. The name is `weight`. There are no buffers. `set_training` does not change the result.
+
+`forward` accepts rank 2 `(N, normalized_shape)` or rank 3 `(N, T, normalized_shape)` and returns the same shape. The scale is the root-mean-square of the last dimension:
+
+```
+y = x * rsqrt(mean(x^2) + eps) * weight
+```
+
+A rank other than 2 or 3, or a last dimension other than `normalized_shape`, throws `RMSNorm input shape`. `backward` returns the input shape and adds into `grad_weight`. A missing forward or a mismatched gradient throws `RMSNorm backward shape`.
+
+The RoPE transformer path uses this norm for `ln1`, `ln2`, and `final_ln`. Learned absolute positions keep LayerNorm.
+
+### Dropout
+
+Header: `nn/layers/dropout.hpp`
+
+```cpp
+Dropout(Context& ctx, float p);
+```
+
+`p` is in `[0, 1)`. Any other value, including NaN, throws `Dropout p`. The layer owns an `std::mt19937` seeded from `std::random_device`. There is no seed setter. There are no parameters and no buffers.
+
+`set_training(true)` is train mode, which is the default. `set_training(false)` is eval mode. `p == 0` is the identity in both modes. Eval mode is the identity for every legal `p`.
+
+In train mode with `p > 0` the layer draws an inverted-dropout mask on the host and uploads it. A kept element is multiplied by `1 / (1 - p)`. A dropped element is 0. `backward` multiplies by that same mask. Each train `forward` draws a new mask.
+
+`forward` accepts any rank a tensor can store and returns the same shape. A backward with no forward, or a gradient whose shape differs from the forward output, throws `Dropout backward shape`.
+
+### MultiHeadAttention
+
+Header: `nn/layers/multi_head_attention.hpp`
+
+```cpp
+MultiHeadAttention(Context& ctx, int d_model, int num_heads, bool causal, bool use_bias,
+                   bool use_rope, std::mt19937& rng);
+```
+
+`d_model` and `num_heads` are at least 1, and `d_model` must be divisible by `num_heads` (`MultiHeadAttention size`). `use_rope == true` applies llama.cpp's default `LLAMA_ROPE_TYPE_NORM` rotation to Q and K after the head split: adjacent pairs inside each head, base 10000, over the whole head dimension `d_model / num_heads`. V is not rotated. An odd head dimension throws `std::invalid_argument` with message `use_rope`. `forward` uses positions `0 .. T-1`. `forward_cached` rotates the new token at `cache.t` before that key is stored. There is no attention dropout. `set_training` does not change the result.
+
+The layer owns four `Linear` children, each `d_model` to `d_model`, constructed in order `q`, `k`, `v`, `out`. Each child uses `use_bias` and draws its weight from `rng`. Bias, when present, starts at 0 and consumes no random numbers. Parameter names are the child prefix plus the linear name:
+
+| Name | Shape | Present |
+|---|---|---|
+| `q.weight`, `k.weight`, `v.weight`, `out.weight` | `(d_model, d_model)` | always |
+| `q.bias`, `k.bias`, `v.bias`, `out.bias` | `(d_model)` | when `use_bias` |
+
+`forward` takes `(N, T, d_model)` and returns the same shape. `Dh = d_model / num_heads`. Projections are the child linears. Attention scores are `Q K^T / sqrt(Dh)` with shape `(N, num_heads, T, T)`. When `causal` is true, entries with key index `j > i` are set to `-1e9` before the softmax over the last dimension. The attention output is projected by `out`. A rank other than 3, or a last dimension other than `d_model`, throws `MultiHeadAttention input shape`.
+
+`backward` returns the input shape and adds into each child's `grad_weight` and, when bias is on, `grad_bias`. A missing forward or a mismatched gradient throws `MultiHeadAttention backward shape`. `zero_grad` clears every child.
+
+```cpp
+struct Cache {
+  Tensor k;  // (N, H, T_max, Dh)
+  Tensor v;  // (N, H, T_max, Dh)
+  int t = 0;  // next write index
+};
+
+void reset_cache(Cache& cache, int batch, int t_max) const;
+const Tensor& forward_cached(const Tensor& x_t, Cache& cache);
+```
+
+`reset_cache` allocates `k` and `v` on this context, zeros them, and sets `t = 0`. `batch < 1` throws `batch`. `t_max < 1` throws `t_max`. Replacing a cache is fine. `forward_cached` is the generation step. `x_t` must be `(N, 1, d_model)` on this context (`x_t`). `N` must match the cache batch and `cache.t` must be less than `T_max` (`cache`). The step projects that token, rotates Q and K when `use_rope` is set, writes K and V at `cache.t`, and attends over keys `0 .. cache.t` inclusive. Scores are `(N, num_heads, 1, cache.t + 1)`, scaled by `1/sqrt(Dh)`, then the same max-subtract softmax as `forward`. The unwritten tail is not read, and there is no `(T, T)` mask. The return is `(N, 1, d_model)`. `cache.t` then increases by 1. `backward` after `forward_cached` throws `forward_cached` instead of the full-sequence backward. A later `forward` clears that state. Full-sequence backward undoes the Q and K rotation before the linear gradients.
+
+### TransformerBlock
+
+Header: `nn/layers/transformer_block.hpp`
+
+```cpp
+struct TransformerBlockSpec {
+  int d_model = 0;
+  int num_heads = 0;
+  int d_ff = 0;
+  float dropout = 0.f;
+  bool bias = false;
+  bool use_rope = false;
+  TransformerActivation activation = TransformerActivation::SwiGLU;
+  bool causal = true;
+};
+
+TransformerBlock(Context& ctx, const TransformerBlockSpec& spec, std::mt19937& rng);
+MultiHeadAttention& attn();
+```
+
+`TransformerActivation` is defined once in `nn/config.hpp` and included by this header.
+
+Pre-norm block. There is no fourth constructor argument. `d_model`, `num_heads`, and `d_ff` are at least 1, and `d_model` must be divisible by `num_heads` (`TransformerBlock size`). `dropout` is in `[0, 1)` (`TransformerBlock dropout`). Any other `activation` throws `TransformerBlock activation`. `use_rope` false builds LayerNorm for `ln1` and `ln2` and leaves attention unrotated. `use_rope` true builds RMSNorm for both norms and passes the flag to `MultiHeadAttention`. `causal` defaults to true and is the attention mask. An odd head dimension throws `std::invalid_argument` with message `use_rope`.
+
+```
+h = x + drop1(mha(ln1(x)))
+y = h + drop2(ffn(ln2(h)))
+```
+
+`d_ff` is the width after the gate. GELU is `Linear(d_model → d_ff)`, `GELU`, `Linear(d_ff → d_model)`. SwiGLU is `Linear(d_model → 2*d_ff)`, `SwiGLU`, `Linear(d_ff → d_model)`. Both linears use `bias`. `attn()` is the owned attention layer. `set_training` reaches both dropouts. Child parameter prefixes are `ln1.`, `attn.`, `drop1.`, `ln2.`, `fc1.`, `fc2.`. Dropout and the activation have no parameters. `forward` takes `(N, T, d_model)` and returns the same shape. A rank other than 3, or a last dimension other than `d_model`, throws `TransformerBlock input shape`. A missing forward or a mismatched gradient throws `TransformerBlock backward shape`.
+
+`forward_cached(x_t, cache)` is the same pre-norm residual, with `mha->forward_cached` instead of `mha->forward`:
+
+```
+h = x_t + drop1(mha->forward_cached(ln1(x_t), cache))
+y = h + drop2(ffn(ln2(h)))
+```
+
+`x_t` and `y` are `(N, 1, d_model)`. Dropout follows `set_training`. Generation calls `eval()`, so dropout is the identity.
+
+### Flatten
+
+Header: `nn/layers/flatten.hpp`
+
+```cpp
+class Flatten : public Layer { /* default constructor */ };
+```
+
+No context and no parameters. `forward` takes `(N, C, H, W)` and returns `(N, C*H*W)`, copying the values in NCHW order. A rank other than 4 throws `Flatten input rank`. A feature count that does not fit in a signed 32-bit integer throws `Flatten features out of range`.
+
+`backward` takes `(N, C*H*W)` and returns `(N, C, H, W)`. Call `forward` first. A backward with no forward throws `Flatten backward without forward`. A mismatched gradient throws `Flatten backward shape`.
+
+### GlobalAvgPool2d
+
+Header: `nn/layers/global_avg_pool2d.hpp`
+
+```cpp
+explicit GlobalAvgPool2d(Context& ctx);
+```
+
+No parameters. `forward` takes `(N, C, H, W)` and returns `(N, C, 1, 1)`. A rank other than 4 throws `GlobalAvgPool2d input rank`. `backward` spreads the `(N, C, 1, 1)` gradient back across the spatial map. A mismatched gradient throws `GlobalAvgPool2d backward shape`.
+
+### ResidualBlock
+
+Header: `nn/layers/residual_block.hpp`
+
+```cpp
+ResidualBlock(Context& ctx, int in_channels, int out_channels, int stride, std::mt19937& rng);
+```
+
+`in_channels`, `out_channels`, and `stride` are at least 1 (`ResidualBlock size`). The block is a basic residual unit:
+
+```
+main = bn2(conv2(relu(bn1(conv1(x)))))
+skip = x                                 when stride == 1 and in_channels == out_channels
+skip = proj_bn(proj(x))                  otherwise
+y    = relu(main + skip)
+```
+
+`conv1` is 3×3 with the given stride and pad 1. `conv2` is 3×3 with stride 1 and pad 1. `proj` is 1×1 with the given stride and pad 0. Every convolution has bias off. Each one consumes `rng` through `kaiming_normal`, in order `conv1`, `conv2`, then `proj` when the projection exists. Batch-norm scale, bias, and running statistics use the `BatchNorm2d` initial values and consume no random numbers.
+
+`forward` takes `(N, in_channels, H, W)`. Output spatial size follows the 3×3 convolution with the block stride and pad 1. Output channels are `out_channels`.
+
+Parameter order:
+
+| Name | Present |
+|---|---|
+| `conv1.weight` | always |
+| `bn1.weight`, `bn1.bias` | always |
+| `conv2.weight` | always |
+| `bn2.weight`, `bn2.bias` | always |
+| `proj.weight` | when the skip projects |
+| `proj_bn.weight`, `proj_bn.bias` | when the skip projects |
+
+Buffers follow the same prefixes: `bn1.running_mean`, `bn1.running_var`, `bn2.running_mean`, `bn2.running_var`, and `proj_bn.running_mean`, `proj_bn.running_var` when the skip projects.
+
+`set_training` forwards to every child. Train mode follows the `BatchNorm2d` rules on each norm in the block, including `N * H * W > 1` at that child's spatial size.
+
+## Configuration
+
+Header: `nn/config.hpp`
+
+Builders call `validate` before they allocate. You can call it yourself. A failed check throws `std::invalid_argument` and the message is the field name.
+
+```cpp
+int conv_out_size(int in, int kernel, int stride, int pad);
+```
+
+The result is `(in + 2 * pad - kernel) / stride + 1`. `kernel` and `stride` are at least 1 (`kernel`, `stride`). `pad` is at least 0 (`pad`). A result below 1 throws `spatial`.
+
+```cpp
+enum class Activation : uint32_t { Relu = 1, Gelu = 2, SwiGLU = 3 };
+```
+
+### MlpConfig
+
+```cpp
+struct MlpConfig {
+  int input_size = 0;
+  std::vector<int> hidden;
+  int output_size = 0;
+  Activation activation = Activation::Relu;
+};
+```
+
+`input_size`, every hidden width, and `output_size` are at least 1. `activation` is `Activation::Relu`, `Activation::Gelu`, or `Activation::SwiGLU`. Any other value throws `activation`.
+
+`Relu` and `Gelu` keep each hidden width. `build_mlp` emits `Linear`, the activation, `Linear`, the activation, ..., `Linear`. The last linear layer has no activation. A hidden width `H` is the output width of that linear layer.
+
+`SwiGLU` uses `H` as the width after the gate. The linear layer before each `SwiGLU` writes `2H` features, so `fc.i.weight` on a hidden layer has shape `(2H, in)` and `fc.i.bias` has shape `(2H)`. `SwiGLU` returns `H` features. The next linear layer reads `H`. The last linear layer writes `output_size` and has no gate. A hidden width above `INT_MAX / 2` throws `hidden`, because `2H` has to fit in a signed 32-bit feature count.
+
+An empty `hidden` builds one linear layer for every activation. Names are `fc.0`, `fc.1`, ... Input shape is `(N, input_size)`. Output shape is `(N, output_size)`.
+
+```cpp
+config.activation = nn::Activation::Gelu;
+
+config.activation = nn::Activation::SwiGLU;
+config.input_size = 8;
+config.hidden = {6};
+config.output_size = 4;
+// fc.0.weight is (12, 8). SwiGLU returns 6 features. fc.1.weight is (4, 6).
+```
+
+### ConvSpec and PoolSpec
+
+```cpp
+struct ConvSpec {
+  int out_channels = 0;
+  int kernel = 0;
+  int stride = 0;
+  int pad = 0;
+};
+
+struct PoolSpec {
+  int kernel = 0;
+  int stride = 0;
+};
+```
+
+`ConvSpec` describes one square convolution. `PoolSpec` describes the square max pool, with pad 0, applied after a convolution.
+
+### ConvConfig
+
+```cpp
+struct ConvConfig {
+  int in_channels = 0;
+  int in_height = 0;
+  int in_width = 0;
+  std::vector<ConvSpec> convs;
+  PoolSpec pool;
+  std::vector<int> fc;
+};
+```
+
+`in_channels`, `in_height`, and `in_width` are at least 1. `convs` and `fc` are nonempty. Each `out_channels` and each fully connected width is at least 1. `validate` walks the spatial size through every convolution and the following pool, and rejects a map that would shrink below 1×1.
+
+`build_conv` emits, for each entry in `convs`, `Conv2d` with bias on, `ReLU`, and `MaxPool2d`. Names are `conv.i` and `pool.i`. It then appends `Flatten` and `fc` linear layers named `fc.i`, with `ReLU` between linear layers. The first linear layer sees `channels * height * width` after the last pool.
+
+### ResNetConfig
+
+```cpp
+struct ResNetConfig {
+  int in_channels = 0;
+  int in_height = 0;
+  int in_width = 0;
+  int stem_channels = 0;
+  std::vector<int> blocks_per_stage;
+  std::vector<int> stage_widths;
+  int output_size = 0;
+};
+```
+
+`in_channels`, `in_height`, `in_width`, `stem_channels`, and `output_size` are at least 1. `blocks_per_stage` and `stage_widths` have the same nonempty length. Each stage width is at least 1. Each stage has at least one block.
+
+`build_resnet` emits:
+
+1. `Conv2d` 3×3, stride 1, pad 1, bias off, named `stem`.
+2. `BatchNorm2d` named `stem.bn`.
+3. `ReLU`.
+4. One `ResidualBlock` per block, named `stages.{s}.blocks.{b}`. Stage 0 uses stride 1. The first block of every later stage uses stride 2. The other blocks use stride 1.
+5. `GlobalAvgPool2d`, `Flatten`, and `Linear` named `head`.
+
+The head's input features are the last stage width. The stem keeps the input spatial size. A projection appears when stride is not 1 or the channel count changes.
+
+### ConvResNetConfig
+
+```cpp
+struct ConvResNetConfig {
+  int in_channels = 0;
+  int in_height = 0;
+  int in_width = 0;
+  std::vector<ConvSpec> convs;
+  PoolSpec pool;
+  int stem_channels = 0;
+  std::vector<int> blocks_per_stage;
+  std::vector<int> stage_widths;
+  std::vector<int> fc;
+};
+```
+
+This config builds one image network with a conv+pool trunk, residual stages, or both. `fc` is always nonempty, and every width in it is at least 1.
+
+| Choice | Rule |
+|---|---|
+| Trunk | `convs` nonempty. Each stage is `Conv2d` (bias on), `ReLU`, `MaxPool2d` using `pool`. |
+| Residual stem | `stem_channels > 0` inserts the 3×3 stride-1 pad-1 bias-off stem, `BatchNorm2d`, and `ReLU`. This requires residual stages. |
+| Residual stages | `blocks_per_stage` nonempty and the same length as `stage_widths`. Stage 0 uses stride 1. Later stages downsample on the first block. |
+| Head | `fc` linear layers named `fc.i`, with `ReLU` between them. |
+
+At least one of `convs` and `blocks_per_stage` is nonempty. `stem_channels < 0` throws `stem_channels`. When stages are present, the builder appends `GlobalAvgPool2d` and `Flatten`, and the first linear layer sees the last stage width. When stages are absent, it appends `Flatten`, and the first linear layer sees `channels * height * width` after the trunk. `pool` is stored in the checkpoint even when `convs` is empty. `validate` checks `pool` when the trunk is present.
+
+Names match the other builders: `conv.i`, `pool.i`, `stem`, `stem.bn`, `stages.{s}.blocks.{b}`, and `fc.i`.
+
+Random draws follow construction order. Each `conv.i.weight` is drawn, then `stem.weight` when the stem is present, then each block's `conv1.weight`, `conv2.weight`, and `proj.weight` when that block projects, then each `fc.i.weight`.
+
+### RnnConfig
+
+```cpp
+struct RnnConfig {
+  int input_size = 0;
+  std::vector<int> hidden;
+  int output_size = 0;
+};
+```
+
+`input_size` and `output_size` are at least 1. `hidden` is nonempty, and every width is at least 1. An empty list or a width below 1 throws `hidden`.
+
+`build_rnn` emits one `RNN` per hidden width, named `rnn.i`, then `LastStep`, then `Linear` named `head`. Layer 0 reads `input_size`. Layer `k` reads `hidden[k - 1]`. The state before the first step is zero and is not a parameter. Each layer reads the full sequence from the layer below. `LastStep` keeps time `T - 1`. The head maps that vector to `output_size`.
+
+Input shape is `(N, T, input_size)`. Output shape is `(N, output_size)`. `T` is at least 1. Labels for `softmax_cross_entropy` have length `N`.
+
+Random draws follow construction order. For each recurrent layer, `rnn.i.weight_ih` is drawn with fan-in equal to that layer's input width, then `rnn.i.weight_hh` with fan-in equal to its hidden width, then `head.weight`.
+
+```cpp
+config.input_size = 8;
+config.hidden = {6, 4};
+config.output_size = 3;
+nn::Network net = nn::build_rnn(ctx, config, /*seed=*/1);
+nn::Tensor sequence(ctx, {32, 10, 8});
+const nn::Tensor& logits = net.forward(sequence);  // (32, 3)
+```
+
+### TransformerConfig
+
+```cpp
+enum class TransformerActivation : uint32_t { Gelu = 1, SwiGLU = 2 };
+enum class PositionalEncoding : uint32_t { LearnedAbsolute = 1, Rope = 2 };
+
+struct TransformerConfig {
+  int vocab_size = 0;
+  int d_model = 0;
+  int num_heads = 0;
+  int num_layers = 0;
+  int d_ff = 0;
+  int max_seq_len = 0;
+  float dropout = 0.f;
+  bool tie_embeddings = false;
+  bool bias = false;
+  TransformerActivation activation = TransformerActivation::SwiGLU;
+  PositionalEncoding positional = PositionalEncoding::LearnedAbsolute;
+  bool causal = true;       // false is bidirectional attention, as in BERT
+  int type_vocab_size = 0;  // 0 omits the segment table. BERT uses 2.
+};
+```
+
+`validate` requires `vocab_size`, `d_model`, `num_heads`, `num_layers`, `d_ff`, and `max_seq_len` to be at least 1. `d_model % num_heads != 0` throws `num_heads`. `dropout` must be in `[0, 1)`, or the call throws `dropout`. `tie_embeddings == true` throws `tie_embeddings`. `activation` is `Gelu` or `SwiGLU`; any other value throws `activation`. `positional == LearnedAbsolute` keeps LayerNorm and a position table. `positional == Rope` keeps RMSNorm and adjacent-pair RoPE, and throws `use_rope` when `d_model / num_heads` is odd. Any other value throws `positional`. When `activation` is SwiGLU and `2 * d_ff` does not fit in a positive `int`, `validate` throws `d_ff`. GELU does not double `d_ff`. `type_vocab_size < 0` throws `type_vocab_size`. `0` omits the segment table. A positive value builds `type_emb`. `causal` false is bidirectional attention. The default is causal.
+
+`Family::Transformer` is `6`. `build_transformer_network` emits `num_layers` `TransformerBlock`s named `blocks.i`, then a final norm named `final_ln` (default eps `1e-5`), then `Linear` named `lm_head` from `d_model` to `vocab_size`. The trunk is those blocks, the final norm, and `lm_head`. It does not own token embeddings or a position table. Each block sets `use_rope` when `positional` is `Rope`, and the final norm is RMSNorm on that path and LayerNorm otherwise. `max_seq_len` is stored on the config and in the checkpoint only.
+
+Forward input is a float tensor `(N, T, d_model)`. Output is `(N, T, vocab_size)`. The trunk does not check `T` against `max_seq_len`.
+
+Random draws follow construction order. For each block, `blocks.i.attn.q.weight`, `k.weight`, `v.weight`, and `out.weight` are drawn, then `blocks.i.fc1.weight` and `blocks.i.fc2.weight`. `lm_head.weight` is drawn last. Layer-norm scale is filled with 1 and does not consume the generator.
+
+```cpp
+config.vocab_size = 10;
+config.d_model = 8;
+config.num_heads = 2;
+config.num_layers = 1;
+config.d_ff = 16;
+config.max_seq_len = 4;
+nn::Network net = nn::build_transformer_network(ctx, config, /*seed=*/1);
+nn::Tensor hidden(ctx, {1, 3, 8});
+const nn::Tensor& logits = net.forward(hidden);  // (1, 3, 10)
+```
+
+### Transformer
+
+Header: `nn/transformer.hpp`
+
+`Transformer` owns `tok_emb` outside the trunk, and the learned-absolute `pos_emb` when `positional` is `LearnedAbsolute`. RoPE leaves `pos_emb` null and does not add a position vector. The trunk is a family-6 `Network`: `blocks.i`, `final_ln`, and `lm_head`. Those embeddings are not layers of the network.
+
+```cpp
+class Transformer {
+ public:
+  Transformer(Context& ctx, const TransformerConfig& config, uint32_t seed);
+
+  const Tensor& forward(const IndexTensor& tokens);  // (N, T) -> logits (N, T, V)
+  const Tensor& forward(const IndexTensor& tokens, const IndexTensor& type_ids);
+  const Tensor& forward(const Tensor& embeddings);   // (N, T, D) -> logits, skips embeddings
+  const Tensor& backward(const Tensor& grad_logits);
+
+  struct GenerateState {
+    std::vector<MultiHeadAttention::Cache> layer_caches;
+    int t = 0;  // next absolute position; tokens consumed so far
+  };
+
+  void reset_generate_state(GenerateState& st, int batch, int t_max);
+  const Tensor& decode_step(const IndexTensor& next_ids, GenerateState& st);  // (N, 1) -> (N, 1, V)
+  const Tensor& prefill(const IndexTensor& prompt_ids, GenerateState& st, int t_max);
+
+  void zero_grad();
+  void train();
+  void eval();
+  bool training() const;
+
+  std::vector<NamedParam> parameters() const;
+  const Network& network() const;
+
+  void save(const std::filesystem::path& path, const Sgd* optimizer) const;
+  void save(const std::filesystem::path& path, const AdamW* optimizer) const;
+  static Loaded load(Context& ctx, const std::filesystem::path& path, LoadMode mode);
+};
+
+struct Transformer::Loaded {
+  Transformer model;
+  std::optional<Sgd> optimizer;
+  uint64_t step = 0;
+  std::optional<AdamW> adamw;
+};
+```
+
+`forward(const IndexTensor&)` reads token ids of shape `(N, T)` and returns logits `(N, T, vocab_size)`. Rank other than 2 throws `tokens`. `T > max_seq_len` throws `max_seq_len` before either embedding runs. Learned-absolute positions are the column index `0 .. T-1` on every row, added to the token embedding. RoPE forwards the token embedding alone. When `type_vocab_size > 0`, that call adds segment 0 at every position. `forward(tokens, type_ids)` requires the segment table and a `type_ids` tensor of the same shape, or it throws `type_ids`. `forward(const Tensor&)` reads a float tensor `(N, T, d_model)` and skips the embeddings. A rank or width mismatch throws `embeddings`. Backward after that hook does not update embedding gradients. Full `forward` does not fill the KV cache. Backward of a token forward updates `tok_emb`, `pos_emb` when it exists, and `type_emb` when it exists.
+
+`reset_generate_state` builds one cache per block (`attn().reset_cache`) and sets `st.t = 0`. `decode_step` and `prefill` throw `causal` when `causal` is false, before any other check. `decode_step` requires `eval()`; `training()` throws `decode_step`. A causal model that also has a segment table adds segment id 0 on the decode step. `next_ids` is `(N, 1)` (`next_ids`) and `N` must match the cache batch (`cache`). `st.t >= max_seq_len` throws `max_seq_len` before the position upload and before the cache write. Learned-absolute positions are the index `st.t` on every row. RoPE rotates Q and K at that same index and does not add a position vector. Each block writes its cache at that index, then `st.t` increases by 1. The return is the `lm_head` tensor `(N, 1, vocab_size)`. `prefill` resets, then runs `decode_step` once per prompt column, and returns the last step's logits. `prompt_ids` is `(N, T_prompt)` with `1 <= T_prompt <= t_max` (`prompt_ids`, `t_max`). `GenerateState` is not written by `save`.
+
+`parameters()` is `tok_emb.weight`, then `pos_emb.weight` when that embedding exists, then `type_emb.weight` when `type_vocab_size > 0`, then `network().parameters()`. `network().parameters()` does not include `tok_emb`, `pos_emb`, or `type_emb`. A RoPE parameter list has no `pos_emb.weight` and no `.bias` on `ln1`, `ln2`, or `final_ln`.
+
+`save(path, nullptr)` writes version 1 with no optimizer block. `save(path, sgd)` writes version 2 and optimizer kind `1` (SGD) before the SGD body. `save(path, adamw)` writes version 2 and optimizer kind `2` (AdamW) followed by the AdamW moments. The flattened groups must match `parameters()` in order, or save throws `optimizer does not belong to this network`. `save(path, static_cast<const AdamW*>(nullptr))` writes version 2 with `optimizer_present` 0 and no optimizer block. Every façade file includes `tok_emb.weight`. A learned-absolute file then includes `pos_emb.weight` and the trunk parameters, including norm biases. A RoPE file goes straight to the trunk, and those norms have a weight only. The loader rebuilds the parameter list from `positional`, so both shapes load. `LoadMode::Resume` restores SGD into `Loaded::optimizer` or AdamW into `Loaded::adamw`, and leaves the other empty. `LoadMode::Inference` leaves both empty. A version-2 kind other than 1 or 2 throws `unsupported optimizer kind N`. `Network::load` accepts version 1 and version 2. A façade file fails that load on parameter count because the trunk has no embeddings. When `causal` is false or `type_vocab_size` is not 0, `save(path, nullptr)` writes version 5 and an AdamW save writes version 6. Version 6 stores an optimizer kind the same way version 2 does. A version 5 or 6 file stores the extended fields, then `causal` and `type_vocab_size`. Versions 1 through 4 load with `causal` true and `type_vocab_size` 0.
+
+```cpp
+nn::Transformer model(ctx, config, /*seed=*/1);
+nn::IndexTensor tokens(ctx, {1, 3});
+const nn::Tensor& logits = model.forward(tokens);  // (1, 3, vocab_size)
+nn::Tensor hidden(ctx, {1, 3, config.d_model});
+const nn::Tensor& hooked = model.forward(hidden);
+model.save(path, nullptr);
+nn::Transformer::Loaded loaded = nn::Transformer::load(ctx, path, nn::LoadMode::Inference);
+```
+
+## Network
+
+Header: `nn/network.hpp`
+
+```cpp
+enum class Family : uint32_t { Mlp = 1, Conv = 2, ResNet = 3, ConvResNet = 4, Rnn = 5, Transformer = 6 };
+
+class Network {
+ public:
+  Network(Context& ctx, Family family, std::vector<std::unique_ptr<Layer>> layers,
+          std::variant<MlpConfig, ConvConfig, ResNetConfig, ConvResNetConfig, RnnConfig, TransformerConfig> config);
+
+  const Tensor& forward(const Tensor& input);
+  const Tensor& backward(const Tensor& grad_output);
+  void zero_grad();
+  void train();
+  void eval();
+  bool training() const;
+  Family family() const;
+  const std::variant<MlpConfig, ConvConfig, ResNetConfig, ConvResNetConfig, RnnConfig, TransformerConfig>& config() const;
+
+  std::vector<NamedParam> parameters() const;
+  std::vector<NamedBuffer> buffers() const;
+
+  void save(const std::filesystem::path& path, const Sgd* optimizer) const;
+  void save(const std::filesystem::path& path, const AdamW* optimizer) const;
+  static Loaded load(Context& ctx, const std::filesystem::path& path, LoadMode mode);
+};
+
+struct Network::Loaded {
+  Network network;
+  std::optional<Sgd> optimizer;
+  std::optional<AdamW> adamw;
+  uint64_t step = 0;
+};
+```
+
+Header: `nn/builders.hpp`
+
+```cpp
+Network build_mlp(Context& ctx, const MlpConfig& config, uint32_t seed);
+Network build_conv(Context& ctx, const ConvConfig& config, uint32_t seed);
+Network build_resnet(Context& ctx, const ResNetConfig& config, uint32_t seed);
+Network build_conv_resnet(Context& ctx, const ConvResNetConfig& config, uint32_t seed);
+Network build_rnn(Context& ctx, const RnnConfig& config, uint32_t seed);
+Network build_transformer_network(Context& ctx, const TransformerConfig& config, uint32_t seed);
+```
+
+`Network` is movable and not copyable. The usual construction is a builder. Each builder validates the config, seeds one `std::mt19937`, and returns a network in train mode. `load` rebuilds with seed 0 and then overwrites every parameter from the file, so the seed used at load time leaves the restored weights unchanged.
+
+`forward` runs the layers in order and returns the last layer's output. `backward` runs them in reverse and returns the gradient of the network input. An empty layer list throws `empty network`.
+
+`train()` and `eval()` set the network flag and call `set_training` on every layer. `training()` reports that flag.
+
+`zero_grad()` zeros every parameter gradient. It leaves parameters, velocity, and batch-norm buffers unchanged.
+
+`config()` returns the variant stored at construction. Read it with `std::get<MlpConfig>`, `std::get<ConvConfig>`, `std::get<ResNetConfig>`, `std::get<ConvResNetConfig>`, `std::get<RnnConfig>`, or `std::get<TransformerConfig>`.
+
+The public constructor is for a caller who already owns the layers. `save` writes `family` and `config`. `load` rebuilds with the builder for that family, then requires the parameter and batch-norm records to match that builder's names and shapes. A checkpoint round-trip is defined for a network produced by one of the six builders. The file version is still 1.
+
+## ConvResNet
+
+Header: `nn/conv_resnet.hpp`
+
+```cpp
+class ConvResNet {
+ public:
+  ConvResNet(Context& ctx, const ConvResNetConfig& config, uint32_t seed);
+  explicit ConvResNet(Network network);
+
+  Network& network();
+  const Network& network() const;
+
+  const Tensor& forward(const Tensor& input);
+  const Tensor& backward(const Tensor& grad_output);
+  void zero_grad();
+  void train();
+  void eval();
+  bool training() const;
+  Family family() const;
+  const ConvResNetConfig& config() const;
+
+  std::vector<NamedParam> parameters() const;
+  std::vector<NamedBuffer> buffers() const;
+  void save(const std::filesystem::path& path, const Sgd* optimizer) const;
+  void save(const std::filesystem::path& path, const AdamW* optimizer) const;
+  static Loaded load(Context& ctx, const std::filesystem::path& path, LoadMode mode);
+};
+
+struct ConvResNet::Loaded {
+  ConvResNet model;
+  std::optional<Sgd> optimizer;
+  std::optional<AdamW> adamw;
+  uint64_t step = 0;
+};
+```
+
+`ConvResNet` owns one `Network` of family `ConvResNet`. It is movable and not copyable. The config constructor calls `build_conv_resnet`. The `Network` constructor moves the network in and throws `ConvResNet family` when `family()` is anything else.
+
+`forward`, `backward`, `zero_grad`, `train`, `eval`, `parameters`, `buffers`, and `save` forward to that network. `config()` returns the `ConvResNetConfig`. `network()` exposes the owned network when a function takes `Network&`, including `Sgd`'s interaction with `parameters()` (call `model.parameters()`; it returns the same tensors).
+
+```cpp
+nn::ConvResNet model(ctx, config, /*seed=*/1);
+nn::Sgd optimizer(model.parameters(), 0.1f, 0.9f);
+
+model.train();
+model.zero_grad();
+const nn::Tensor& logits = model.forward(images);
+nn::LossResult loss = nn::softmax_cross_entropy(ctx, logits, labels);
+model.backward(loss.grad_logits);
+optimizer.step();
+
+model.save(path, &optimizer);
+nn::ConvResNet::Loaded loaded =
+    nn::ConvResNet::load(ctx, path, nn::LoadMode::Resume);
+```
+
+`ConvResNet::load` uses `Network::load`, then requires family `ConvResNet`. A file of another family throws `bad checkpoint family`.
+
+Three legal configs, each with `fc` set:
+
+```cpp
+// Trunk only. After the pool, Flatten feeds fc.
+config.convs = {nn::ConvSpec{8, 3, 1, 1}};
+config.pool = nn::PoolSpec{2, 2};
+config.fc = {10};
+
+// Residual stages only. Global average pool feeds fc.
+config.stem_channels = 8;
+config.blocks_per_stage = {1, 1};
+config.stage_widths = {8, 16};
+config.fc = {10};
+
+// Trunk, then stem and residual stages, then fc.
+config.convs = {nn::ConvSpec{8, 3, 1, 1}};
+config.pool = nn::PoolSpec{2, 2};
+config.stem_channels = 8;
+config.blocks_per_stage = {1, 1};
+config.stage_widths = {8, 16};
+config.fc = {10};
+```
+
+## Sgd
+
+Header: `nn/optim.hpp`
+
+```cpp
+class Sgd {
+ public:
+  Sgd(std::vector<NamedParam> params, float learning_rate, float momentum);
+
+  void step();
+  void set_learning_rate(float learning_rate);
+  float learning_rate() const;
+  float momentum() const;
+  uint64_t step_count() const;
+  void set_step_count(uint64_t step);
+
+  const std::vector<Tensor>& velocity() const;
+  std::vector<Tensor>& velocity();
+  const std::vector<NamedParam>& params() const;
+};
+```
+
+Construct `Sgd` from `network.parameters()` or `model.parameters()` after the network exists. An empty list throws `SGD has no parameters`. The optimizer is movable and not copyable. It copies the parameter pointers and allocates one velocity tensor per parameter on the first parameter's context. Velocity starts at zero. `step_count()` starts at 0.
+
+`step()` applies Polyak momentum on the context stream, then increments `step_count` by one:
+
+```
+velocity = momentum * velocity + gradient
+parameter = parameter - learning_rate * velocity
+```
+
+`set_learning_rate` changes the rate used by later steps. Momentum stays at the value given to the constructor. `set_step_count` sets the counter that `save` writes. `load` with `LoadMode::Resume` calls it with the stored step.
+
+Pass the same optimizer to `save`. `save` checks pointer identity, in order, against the network's parameters. A mismatch throws `optimizer does not belong to this network`.
+
+Moving a `Network` or a `ConvResNet` moves the `unique_ptr<Layer>` elements. The layer objects stay where they are, so an `Sgd` built from those parameters remains valid after the move.
+
+## AdamW
+
+Header: `nn/optim.hpp`
+
+```cpp
+struct AdamWGroup {
+  std::vector<NamedParam> params;
+  float weight_decay = 0.f;
+};
+
+class AdamW {
+ public:
+  AdamW(std::vector<AdamWGroup> groups, float lr, float beta1, float beta2, float eps);
+  AdamW(std::vector<NamedParam> params, float lr, float beta1, float beta2, float eps,
+        float weight_decay);
+
+  void step();
+  void set_learning_rate(float lr);
+  float learning_rate() const;
+  float beta1() const;
+  float beta2() const;
+  float eps() const;
+  uint64_t step_count() const;
+  void set_step_count(uint64_t step);
+  const std::vector<AdamWGroup>& groups() const;
+  const std::vector<Tensor>& m() const;
+  std::vector<Tensor>& m();
+  const std::vector<Tensor>& v() const;
+  std::vector<Tensor>& v();
+};
+
+float clip_grad_norm(const std::vector<NamedParam>& params, float max_norm);
+```
+
+`AdamW` is movable and not copyable. Pass one or more groups. An empty group list, or a group with no parameters, throws `std::invalid_argument`. So does a null value or gradient, a gradient whose element count differs from its parameter, or the same parameter listed twice. A non-finite learning rate, beta, epsilon, or group weight decay throws `std::invalid_argument`. The second constructor is a single group. `set_learning_rate` rejects a non-finite rate.
+
+Moments start at zero, match each parameter's shape, and live on the first parameter's context. `m()` and `v()` follow `groups()` flattened. `step()` increments the step count, then applies decoupled AdamW with that group's weight decay:
+
+```
+m = beta1 * m + (1 - beta1) * gradient
+v = beta2 * v + (1 - beta2) * gradient^2
+m_hat = m / (1 - beta1^t)
+v_hat = v / (1 - beta2^t)
+parameter = parameter - lr * (m_hat / (sqrt(v_hat) + eps) + weight_decay * parameter)
+```
+
+`t` is the step count after the increment. Bias correction uses that power.
+
+`save(path, &adamw)` writes checkpoint version 2. The flattened groups must be the network parameters in `parameters()` order, because resume splits that list by the stored group sizes. A mismatch throws `optimizer does not belong to this network`. `save(path, nullptr)` is still version 1. Pass `static_cast<const AdamW*>(nullptr)` to write version 2 with no optimizer block.
+
+`clip_grad_norm` returns the L2 norm of the gradients before scaling. It scales every non-null gradient in place by `min(1, max_norm / (total_norm + 1e-6))`. A null `grad` is skipped. An empty list returns `0` and does nothing. `max_norm <= 0` throws `std::invalid_argument`.
+
+```cpp
+std::vector<nn::NamedParam> params = net.parameters();
+nn::AdamWGroup decay;
+nn::AdamWGroup plain;
+decay.weight_decay = 0.01f;
+// Contiguous slices of parameters(), one linear layer per group.
+decay.params.assign(params.begin(), params.begin() + 2);
+plain.params.assign(params.begin() + 2, params.end());
+nn::AdamW opt({decay, plain}, 1e-3f, 0.9f, 0.999f, 1e-8f);
+nn::clip_grad_norm(net.parameters(), 1.f);
+opt.step();
+net.save(path, &opt);
+```
+
+## Checkpoints
+
+Header: `nn/checkpoint.hpp`
+
+```cpp
+enum class LoadMode { Inference, Resume };
+```
+
+```cpp
+network.save(path, &optimizer);  // version 1: parameters, batch-norm state, and momentum
+network.save(path, nullptr);     // version 1: parameters and batch-norm state; the stored step is 0
+network.save(path, &adamw);      // version 2: parameters, batch-norm state, and AdamW moments
+
+nn::Network::Loaded loaded = nn::Network::load(ctx, path, nn::LoadMode::Inference);
+nn::Network::Loaded resumed = nn::Network::load(ctx, path, nn::LoadMode::Resume);
+```
+
+`save` synchronizes, copies device state to the host, and writes `path` with a `.tmp` suffix. It `fsync`s, closes, and renames that file onto `path`. A failure removes the temporary file and leaves an existing `path` in place. Host file errors throw `checkpoint write: ` plus `strerror`.
+
+`Loaded::network` is the rebuilt network. `Loaded::step` is the step stored in the file. `LoadMode::Resume` sets `Loaded::optimizer` for an SGD block and `Loaded::adamw` for an AdamW block. At most one is set. A version-1 file never sets `adamw`. `LoadMode::Inference` parses either optimizer block, checks it, and leaves both empty. `LoadMode::Resume` throws `optimizer block missing` when the file has no optimizer block. The restored network is in the train or eval mode stored in the file.
+
+Version 2 uses the same 32-byte header with version field `2`. When an optimizer block is present, its first field is `optimizer_kind` (`1` SGD, `2` AdamW). An SGD payload after that kind tag matches the version-1 body. An AdamW payload stores the learning rate, betas, epsilon, then each group's weight decay and moments `m` and `v` in `groups()` order. Unknown versions and unknown kinds throw.
+
+`load` checks every record before it copies any parameter to the device. A file that fails validation leaves the caller with the exception and no half-updated network.
+
+| Condition | Message |
+|---|---|
+| Unreadable, shorter than 32 bytes, or cut off mid-record | `truncated checkpoint` |
+| Wrong magic | `bad checkpoint magic` |
+| Version other than 1 or 2 | `unsupported checkpoint version N` |
+| Version 2 optimizer kind other than 1 or 2 | `unsupported optimizer kind N` |
+| Bad train flag, optimizer flag, or reserved word | `bad checkpoint header` |
+| Family outside 1..6 | `bad checkpoint family` |
+| `ConvResNet::load` of another family | `bad checkpoint family` |
+| Parameter or batch-norm record disagrees with the rebuilt network | `checkpoint tensor mismatch: ...` |
+| `Resume` and the optimizer flag is 0 | `optimizer block missing` |
+| Optimizer record count disagrees | `optimizer state mismatch` |
+| `save` optimizer belongs to other parameters | `optimizer does not belong to this network` |
+
+The byte layout is little-endian, in [README.md](README.md). Version 1 is an SGD checkpoint or a checkpoint with no optimizer. Version 2 is the same header and model records, plus an optimizer kind tag when an optimizer is stored (`1` SGD, `2` AdamW). `Network::save` writes version 2 for AdamW. `Transformer::save` writes version 1 for `nullptr`, version 2 with SGD kind 1, and version 2 with AdamW kind 2. A null `AdamW*` is version 2 with no optimizer block. The file holds the config, the parameters, the batch-norm running statistics, and, when requested, SGD velocity or AdamW moments. It leaves out activation caches, gradients, and workspaces. A façade file loaded with `Network::load` fails on parameter count because the trunk has no embeddings.
+
+## kaiming_normal
+
+Header: `nn/init.hpp`
+
+```cpp
+void kaiming_normal(Tensor& weight, int fan_in, std::mt19937& rng);
+```
+
+Fills `weight` with a normal distribution of mean 0 and standard deviation `sqrt(2 / fan_in)`, then synchronizes. `fan_in` is at least 1 (`kaiming fan_in`). `Linear` uses `in_features`. `Conv2d` uses `in_channels * kernel * kernel`. `RNN` uses `input_size` for `weight_ih` and `hidden_size` for `weight_hh`. Builders call this for you. Call it when you construct a `Linear`, `Conv2d`, or `RNN` yourself and want to draw again into an existing weight tensor.
+
+## normal_
+
+Header: `nn/init.hpp`
+
+```cpp
+void normal_(Tensor& tensor, float mean, float std, std::mt19937& rng);
+```
+
+Fills `tensor` on the host from a normal distribution with the given mean and standard deviation, copies those values to the device, then synchronizes. `std` must be positive and finite (`normal_ std`). `mean` must be finite (`normal_ mean`). `Embedding` calls this with mean 0 and standard deviation 0.02. The standard deviation is an argument; it is not fixed inside `Embedding` alone.
