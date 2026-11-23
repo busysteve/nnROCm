@@ -1,5 +1,6 @@
 #include "nn/layers/embedding.hpp"
 
+#include "activate.hpp"
 #include "check.hpp"
 #include "context_impl.hpp"
 #include "ensure.hpp"
@@ -119,9 +120,23 @@ const Tensor& Embedding::forward_indices(const IndexTensor& indices) {
 
   std::vector<int> out_shape = indices.shape();
   out_shape.push_back(embedding_dim_);
-  ensure_tensor(output_, *ctx_, out_shape);
+  ensure_activation(output_, *ctx_, out_shape);
   const int64_t rows = cache_indices_->numel();
   const int64_t n = rows * static_cast<int64_t>(embedding_dim_);
+  if (output_->dtype() == DType::BFloat16) {
+    arena_reset(*ctx_);
+    float* y = arena_f32(*ctx_, n);
+    if ((embedding_dim_ % 4) == 0 && aligned16(y) && aligned16(weight_.data())) {
+      embedding_gather4_kernel<<<blocks_for(n / 4), 256, 0, stream>>>(
+          y, weight_.data(), cache_indices_->data(), rows, embedding_dim_);
+    } else {
+      embedding_gather_kernel<<<blocks_for(n), 256, 0, stream>>>(y, weight_.data(), cache_indices_->data(),
+                                                                 rows, embedding_dim_);
+    }
+    check_hip(hipGetLastError(), "embedding_gather");
+    keep_f32(*ctx_, *output_, y);
+    return *output_;
+  }
   if ((embedding_dim_ % 4) == 0 && aligned16(output_->data()) && aligned16(weight_.data())) {
     embedding_gather4_kernel<<<blocks_for(n / 4), 256, 0, stream>>>(
         output_->data(), weight_.data(), cache_indices_->data(), rows, embedding_dim_);
@@ -138,11 +153,18 @@ const Tensor& Embedding::backward(const Tensor& grad_output) {
   if (grad_output.shape() != output_->shape()) throw Error("Embedding backward shape");
   const int64_t rows = cache_indices_->numel();
   const int64_t n = rows * static_cast<int64_t>(embedding_dim_);
-  embedding_scatter_kernel<<<blocks_for(n), 256, 0, stream_of(*ctx_)>>>(
-      grad_weight_.data(), grad_output.data(), cache_indices_->data(), rows, embedding_dim_);
+  if (grad_output.dtype() == DType::BFloat16) {
+    arena_reset(*ctx_);
+    float* dy = stage_f32(*ctx_, grad_output);
+    embedding_scatter_kernel<<<blocks_for(n), 256, 0, stream_of(*ctx_)>>>(
+        grad_weight_.data(), dy, cache_indices_->data(), rows, embedding_dim_);
+  } else {
+    embedding_scatter_kernel<<<blocks_for(n), 256, 0, stream_of(*ctx_)>>>(
+        grad_weight_.data(), grad_output.data(), cache_indices_->data(), rows, embedding_dim_);
+  }
   check_hip(hipGetLastError(), "embedding_scatter");
   // Ids are discrete. Own a zero tensor so the returned reference follows the layer rule.
-  ensure_tensor(grad_input_, *ctx_, grad_output.shape());
+  ensure_activation(grad_input_, *ctx_, grad_output.shape());
   grad_input_->zero();
   return *grad_input_;
 }

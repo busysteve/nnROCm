@@ -1,5 +1,6 @@
 #include "nn/layers/batch_norm2d.hpp"
 
+#include "activate.hpp"
 #include "check.hpp"
 #include "context_impl.hpp"
 #include "ensure.hpp"
@@ -191,17 +192,39 @@ void BatchNorm2d::set_training(bool training) { training_ = training; }
 
 void BatchNorm2d::bind(const Tensor& input) {
   if (input.rank() != 4 || input.shape()[1] != channels_) throw Error("BatchNorm2d input shape");
-  ensure_tensor(output_, *ctx_, input.shape());
-  ensure_tensor(grad_input_, *ctx_, input.shape());
+  ensure_activation(output_, *ctx_, input.shape());
+  ensure_activation(grad_input_, *ctx_, input.shape());
 }
 
 const Tensor& BatchNorm2d::forward(const Tensor& input) {
   bind(input);
-  ensure_tensor(cache_x_, *ctx_, input.shape());
-  cache_x_->copy_from(input);
+  ensure_activation(cache_x_, *ctx_, input.shape());
   const int n = input.shape()[0];
   const int spatial = input.shape()[2] * input.shape()[3];
   hipStream_t stream = stream_of(*ctx_);
+  if (output_->dtype() == DType::BFloat16) {
+    arena_reset(*ctx_);
+    float* x = stage_f32(*ctx_, input);
+    float* y = arena_f32(*ctx_, output_->numel());
+    if (training_) {
+      const int64_t count = static_cast<int64_t>(n) * spatial;
+      if (count <= 1) throw Error("BatchNorm train mode needs more than one value per channel");
+      ++batches_;
+      const float factor = 1.f / static_cast<float>(batches_);
+      bn_train_kernel<<<channels_, 256, 0, stream>>>(
+          y, x, weight_.data(), bias_.data(), running_mean_.data(), running_var_.data(), saved_mean_.data(),
+          saved_inv_variance_.data(), n, channels_, spatial, factor, 1e-5f);
+      check_hip(hipGetLastError(), "batch_norm_forward");
+    } else {
+      bn_eval_kernel<<<channels_, 256, 0, stream>>>(y, x, weight_.data(), bias_.data(), running_mean_.data(),
+                                                    running_var_.data(), n, channels_, spatial, 1e-5f);
+      check_hip(hipGetLastError(), "batch_norm_forward");
+    }
+    keep_f32(*ctx_, *cache_x_, x);
+    keep_f32(*ctx_, *output_, y);
+    return *output_;
+  }
+  cache_x_->copy_from(input);
   if (training_) {
     const int64_t count = static_cast<int64_t>(n) * spatial;
     if (count <= 1) throw Error("BatchNorm train mode needs more than one value per channel");
@@ -226,6 +249,18 @@ const Tensor& BatchNorm2d::backward(const Tensor& grad_output) {
   if (!cache_x_ || grad_output.shape() != cache_x_->shape()) throw Error("BatchNorm2d backward shape");
   const int n = cache_x_->shape()[0];
   const int spatial = cache_x_->shape()[2] * cache_x_->shape()[3];
+  if (grad_input_->dtype() == DType::BFloat16) {
+    arena_reset(*ctx_);
+    float* x = stage_f32(*ctx_, *cache_x_);
+    float* dy = stage_f32(*ctx_, grad_output);
+    float* dx = arena_f32(*ctx_, cache_x_->numel());
+    bn_backward_kernel<<<channels_, 256, 0, stream_of(*ctx_)>>>(
+        dx, x, dy, weight_.data(), grad_weight_.data(), grad_bias_.data(), saved_mean_.data(),
+        saved_inv_variance_.data(), n, channels_, spatial);
+    check_hip(hipGetLastError(), "batch_norm_backward");
+    keep_f32(*ctx_, *grad_input_, dx);
+    return *grad_input_;
+  }
   bn_backward_kernel<<<channels_, 256, 0, stream_of(*ctx_)>>>(
       grad_input_->data(), cache_x_->data(), grad_output.data(), weight_.data(), grad_weight_.data(),
       grad_bias_.data(), saved_mean_.data(), saved_inv_variance_.data(), n, channels_, spatial);

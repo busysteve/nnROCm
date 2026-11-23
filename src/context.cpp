@@ -101,9 +101,18 @@ Context::Context(const std::string& choice) : impl_(std::make_unique<Impl>()) {
 
 Context::~Context() {
   if (!impl_) return;
+  for (const ArenaBlock& block : impl_->f32_arena) hipFree(block.ptr);
+  for (const ArenaBlock& block : impl_->bf16_arena) hipFree(block.ptr);
   if (impl_->blas) hipblasDestroy(impl_->blas);
   if (impl_->stream) hipStreamDestroy(impl_->stream);
 }
+
+void Context::set_activation_dtype(DType dtype) {
+  if (dtype != DType::Float32 && dtype != DType::BFloat16) throw Error("dtype");
+  impl_->activation = dtype;
+}
+
+DType Context::activation_dtype() const { return impl_->activation; }
 
 void Context::synchronize() const {
   check_hip(hipStreamSynchronize(impl_->stream), "hipStreamSynchronize");

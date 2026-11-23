@@ -1,5 +1,6 @@
 #include "nn/layers/max_pool2d.hpp"
 
+#include "activate.hpp"
 #include "check.hpp"
 #include "context_impl.hpp"
 #include "ensure.hpp"
@@ -90,9 +91,33 @@ const Tensor& MaxPool2d::forward(const Tensor& input) {
   const int w = input.shape()[3];
   const int ho = conv_out_size(h, kernel_, stride_, 0);
   const int wo = conv_out_size(w, kernel_, stride_, 0);
-  ensure_tensor(cache_x_, *ctx_, input.shape());
-  ensure_tensor(output_, *ctx_, {n, c, ho, wo});
-  ensure_tensor(cache_y_, *ctx_, output_->shape());
+  ensure_activation(cache_x_, *ctx_, input.shape());
+  ensure_activation(output_, *ctx_, {n, c, ho, wo});
+  ensure_activation(cache_y_, *ctx_, output_->shape());
+  if (output_->dtype() == DType::BFloat16) {
+    const int64_t outs = output_->numel();
+    if (impl_->capacity < outs) {
+      if (impl_->index) {
+        hipStreamSynchronize(stream_of(*ctx_));
+        hipFree(impl_->index);
+        impl_->index = nullptr;
+        impl_->capacity = 0;
+      }
+      check_hip(hipMalloc(reinterpret_cast<void**>(&impl_->index), static_cast<size_t>(outs) * sizeof(int)),
+                "hipMalloc");
+      impl_->capacity = outs;
+    }
+    arena_reset(*ctx_);
+    float* x = stage_f32(*ctx_, input);
+    float* y = arena_f32(*ctx_, outs);
+    maxpool_forward_kernel<<<blocks_for(outs), 256, 0, stream_of(*ctx_)>>>(y, impl_->index, x, n, c, h, w, ho,
+                                                                          wo, kernel_, stride_);
+    check_hip(hipGetLastError(), "max_pool_forward");
+    keep_f32(*ctx_, *cache_x_, x);
+    keep_f32(*ctx_, *output_, y);
+    keep_f32(*ctx_, *cache_y_, y);
+    return *output_;
+  }
   cache_x_->copy_from(input);
   const int64_t outs = output_->numel();
   if (impl_->capacity < outs) {
@@ -117,14 +142,25 @@ const Tensor& MaxPool2d::backward(const Tensor& grad_output) {
   if (!cache_x_ || !cache_y_ || grad_output.shape() != cache_y_->shape()) {
     throw Error("MaxPool2d backward shape");
   }
-  ensure_tensor(grad_input_, *ctx_, cache_x_->shape());
-  grad_input_->zero();
+  ensure_activation(grad_input_, *ctx_, cache_x_->shape());
   const int n = cache_x_->shape()[0];
   const int c = cache_x_->shape()[1];
   const int h = cache_x_->shape()[2];
   const int w = cache_x_->shape()[3];
   const int ho = cache_y_->shape()[2];
   const int wo = cache_y_->shape()[3];
+  if (grad_input_->dtype() == DType::BFloat16) {
+    arena_reset(*ctx_);
+    float* dy = stage_f32(*ctx_, grad_output);
+    float* dx = arena_f32(*ctx_, grad_input_->numel());
+    zero_f32(*ctx_, dx, grad_input_->numel());
+    maxpool_backward_kernel<<<blocks_for(grad_output.numel()), 256, 0, stream_of(*ctx_)>>>(
+        dx, dy, impl_->index, n, c, h, w, ho, wo);
+    check_hip(hipGetLastError(), "max_pool_backward");
+    keep_f32(*ctx_, *grad_input_, dx);
+    return *grad_input_;
+  }
+  grad_input_->zero();
   maxpool_backward_kernel<<<blocks_for(grad_output.numel()), 256, 0, stream_of(*ctx_)>>>(
       grad_input_->data(), grad_output.data(), impl_->index, n, c, h, w, ho, wo);
   check_hip(hipGetLastError(), "max_pool_backward");

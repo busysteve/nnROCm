@@ -1,5 +1,6 @@
 #include "kernels.hpp"
 
+#include "activate.hpp"
 #include "check.hpp"
 #include "context_impl.hpp"
 #include "launch.hpp"
@@ -320,7 +321,17 @@ void launch_mul(hipStream_t stream, float* y, const float* a, const float* b, in
   check_hip(hipGetLastError(), "mul");
 }
 
-void Tensor::scale(float factor) { launch_scale(stream_of(*ctx_), data_, numel_, factor); }
+void Tensor::scale(float factor) {
+  if (dtype() == DType::Float32) {
+    launch_scale(stream_of(*ctx_), data(), numel_, factor);
+    return;
+  }
+  arena_reset(*ctx_);
+  float* tmp = arena_f32(*ctx_, numel_);
+  cast_bf16_to_f32(*ctx_, tmp, bf16_data(), numel_);
+  launch_scale(stream_of(*ctx_), tmp, numel_, factor);
+  cast_f32_to_bf16(*ctx_, bf16_data(), tmp, numel_);
+}
 
 void launch_scale(hipStream_t stream, float* x, int64_t n, float scale) {
   if (n <= 0) return;

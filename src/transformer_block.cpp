@@ -1,5 +1,6 @@
 #include "nn/layers/transformer_block.hpp"
 
+#include "activate.hpp"
 #include "context_impl.hpp"
 #include "ensure.hpp"
 #include "kernels.hpp"
@@ -123,13 +124,31 @@ const Tensor& TransformerBlock::forward(const Tensor& input) {
   if (shape.size() != 3 || shape[2] != d_model_) throw Error("TransformerBlock input shape");
 
   const Tensor& dropped_attn = drop1_->forward(mha_->forward(ln1_->forward(input)));
-  ensure_tensor(hidden_, *ctx_, shape);
-  launch_add2(stream_of(*ctx_), hidden_->data(), input.data(), dropped_attn.data(), input.numel());
+  ensure_activation(hidden_, *ctx_, shape);
+  if (hidden_->dtype() == DType::BFloat16) {
+    arena_reset(*ctx_);
+    float* a = stage_f32(*ctx_, input);
+    float* b = stage_f32(*ctx_, dropped_attn);
+    float* y = arena_f32(*ctx_, input.numel());
+    launch_add2(stream_of(*ctx_), y, a, b, input.numel());
+    keep_f32(*ctx_, *hidden_, y);
+  } else {
+    launch_add2(stream_of(*ctx_), hidden_->data(), input.data(), dropped_attn.data(), input.numel());
+  }
 
   const Tensor& dropped_ff =
       drop2_->forward(fc2_->forward(act_->forward(fc1_->forward(ln2_->forward(*hidden_)))));
-  ensure_tensor(output_, *ctx_, shape);
-  launch_add2(stream_of(*ctx_), output_->data(), hidden_->data(), dropped_ff.data(), input.numel());
+  ensure_activation(output_, *ctx_, shape);
+  if (output_->dtype() == DType::BFloat16) {
+    arena_reset(*ctx_);
+    float* a = stage_f32(*ctx_, *hidden_);
+    float* b = stage_f32(*ctx_, dropped_ff);
+    float* y = arena_f32(*ctx_, input.numel());
+    launch_add2(stream_of(*ctx_), y, a, b, input.numel());
+    keep_f32(*ctx_, *output_, y);
+  } else {
+    launch_add2(stream_of(*ctx_), output_->data(), hidden_->data(), dropped_ff.data(), input.numel());
+  }
   return *output_;
 }
 
@@ -138,13 +157,31 @@ const Tensor& TransformerBlock::forward_cached(const Tensor& input, MultiHeadAtt
   if (shape.size() != 3 || shape[2] != d_model_) throw Error("TransformerBlock input shape");
 
   const Tensor& dropped_attn = drop1_->forward(mha_->forward_cached(ln1_->forward(input), cache));
-  ensure_tensor(hidden_, *ctx_, shape);
-  launch_add2(stream_of(*ctx_), hidden_->data(), input.data(), dropped_attn.data(), input.numel());
+  ensure_activation(hidden_, *ctx_, shape);
+  if (hidden_->dtype() == DType::BFloat16) {
+    arena_reset(*ctx_);
+    float* a = stage_f32(*ctx_, input);
+    float* b = stage_f32(*ctx_, dropped_attn);
+    float* y = arena_f32(*ctx_, input.numel());
+    launch_add2(stream_of(*ctx_), y, a, b, input.numel());
+    keep_f32(*ctx_, *hidden_, y);
+  } else {
+    launch_add2(stream_of(*ctx_), hidden_->data(), input.data(), dropped_attn.data(), input.numel());
+  }
 
   const Tensor& dropped_ff =
       drop2_->forward(fc2_->forward(act_->forward(fc1_->forward(ln2_->forward(*hidden_)))));
-  ensure_tensor(output_, *ctx_, shape);
-  launch_add2(stream_of(*ctx_), output_->data(), hidden_->data(), dropped_ff.data(), input.numel());
+  ensure_activation(output_, *ctx_, shape);
+  if (output_->dtype() == DType::BFloat16) {
+    arena_reset(*ctx_);
+    float* a = stage_f32(*ctx_, *hidden_);
+    float* b = stage_f32(*ctx_, dropped_ff);
+    float* y = arena_f32(*ctx_, input.numel());
+    launch_add2(stream_of(*ctx_), y, a, b, input.numel());
+    keep_f32(*ctx_, *output_, y);
+  } else {
+    launch_add2(stream_of(*ctx_), output_->data(), hidden_->data(), dropped_ff.data(), input.numel());
+  }
   return *output_;
 }
 
@@ -155,12 +192,30 @@ const Tensor& TransformerBlock::backward(const Tensor& grad_output) {
   // y = h + ffn(h), and h = x + attn(x). Each skip carries the full upstream gradient.
   const Tensor& g_ffn =
       ln2_->backward(fc1_->backward(act_->backward(fc2_->backward(drop2_->backward(grad_output)))));
-  ensure_tensor(grad_hidden_, *ctx_, hidden_->shape());
-  launch_add2(stream_of(*ctx_), grad_hidden_->data(), grad_output.data(), g_ffn.data(),
-              grad_output.numel());
+  ensure_activation(grad_hidden_, *ctx_, hidden_->shape());
+  if (grad_hidden_->dtype() == DType::BFloat16) {
+    arena_reset(*ctx_);
+    float* a = stage_f32(*ctx_, grad_output);
+    float* b = stage_f32(*ctx_, g_ffn);
+    float* y = arena_f32(*ctx_, grad_output.numel());
+    launch_add2(stream_of(*ctx_), y, a, b, grad_output.numel());
+    keep_f32(*ctx_, *grad_hidden_, y);
+  } else {
+    launch_add2(stream_of(*ctx_), grad_hidden_->data(), grad_output.data(), g_ffn.data(),
+                grad_output.numel());
+  }
 
   const Tensor& g_attn = ln1_->backward(mha_->backward(drop1_->backward(*grad_hidden_)));
-  ensure_tensor(grad_input_, *ctx_, hidden_->shape());
+  ensure_activation(grad_input_, *ctx_, hidden_->shape());
+  if (grad_input_->dtype() == DType::BFloat16) {
+    arena_reset(*ctx_);
+    float* a = stage_f32(*ctx_, *grad_hidden_);
+    float* b = stage_f32(*ctx_, g_attn);
+    float* y = arena_f32(*ctx_, grad_output.numel());
+    launch_add2(stream_of(*ctx_), y, a, b, grad_output.numel());
+    keep_f32(*ctx_, *grad_input_, y);
+    return *grad_input_;
+  }
   launch_add2(stream_of(*ctx_), grad_input_->data(), grad_hidden_->data(), g_attn.data(),
               grad_output.numel());
   return *grad_input_;

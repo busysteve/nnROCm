@@ -1,5 +1,6 @@
 #include "nn/loss.hpp"
 
+#include "activate.hpp"
 #include "check.hpp"
 #include "context_impl.hpp"
 #include "kernels.hpp"
@@ -165,7 +166,14 @@ LossResult softmax_cross_entropy(Context& ctx, const Tensor& logits, const Devic
   check_hip(hipMalloc(&bad, sizeof(int)), "hipMalloc");
   hipStream_t stream = stream_of(ctx);
   check_hip(hipMemsetAsync(bad, 0, sizeof(int), stream), "hipMemsetAsync");
-  softmax_ce_kernel<<<n, 256, 0, stream>>>(logits.data(), labels.data(), result.grad_logits.data(),
+  const float* logits_ptr;
+  if (logits.dtype() == DType::BFloat16) {
+    arena_reset(ctx);
+    logits_ptr = stage_f32(ctx, logits);
+  } else {
+    logits_ptr = logits.data();
+  }
+  softmax_ce_kernel<<<n, 256, 0, stream>>>(logits_ptr, labels.data(), result.grad_logits.data(),
                                            per_sample, n, classes, bad);
   check_hip(hipGetLastError(), "softmax_cross_entropy");
 
@@ -265,7 +273,14 @@ LossResult sequence_cross_entropy(Context& ctx, const Tensor& logits, const Inde
     hipFree(counts);
     check_hip(alloc, "hipMalloc");
   }
-  sequence_ce_kernel<<<rows, 256, 0, stream>>>(logits.data(), labels.data(), result.grad_logits.data(),
+  const float* logits_ptr;
+  if (logits.dtype() == DType::BFloat16) {
+    arena_reset(ctx);
+    logits_ptr = stage_f32(ctx, logits);
+  } else {
+    logits_ptr = logits.data();
+  }
+  sequence_ce_kernel<<<rows, 256, 0, stream>>>(logits_ptr, labels.data(), result.grad_logits.data(),
                                                per_sample, rows, classes, ignore_index, n_valid, bad);
   const hipError_t launch = hipGetLastError();
   if (launch != hipSuccess) {

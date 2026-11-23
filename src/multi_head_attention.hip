@@ -1,5 +1,6 @@
 #include "nn/layers/multi_head_attention.hpp"
 
+#include "activate.hpp"
 #include "check.hpp"
 #include "context_impl.hpp"
 #include "ensure.hpp"
@@ -163,6 +164,15 @@ __global__ void write_kv_kernel(float* dst, const float* src, int t, int t_max, 
   dst[(head * static_cast<int64_t>(t_max) + t) * dh + d] = src[i];
 }
 
+__global__ void write_kv_bf16_kernel(uint16_t* dst, const uint16_t* src, int t, int t_max, int dh,
+                                     int64_t n) {
+  const int64_t i = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (i >= n) return;
+  const int d = static_cast<int>(i % dh);
+  const int64_t head = i / dh;
+  dst[(head * static_cast<int64_t>(t_max) + t) * dh + d] = src[i];
+}
+
 __device__ float masked_score(float value, int col, int query, int causal) {
   if (causal && col > query) return kMask;
   return value;
@@ -241,6 +251,12 @@ void launch_merge_heads(hipStream_t stream, float* dst, const float* src, int ti
 void launch_write_kv(hipStream_t stream, float* dst, const float* src, int t, int t_max, int dh,
                      int64_t n) {
   write_kv_kernel<<<blocks_for(n), kThreads, 0, stream>>>(dst, src, t, t_max, dh, n);
+  check_hip(hipGetLastError(), "mha_write_kv");
+}
+
+void launch_write_kv_bf16(hipStream_t stream, uint16_t* dst, const uint16_t* src, int t, int t_max, int dh,
+                          int64_t n) {
+  write_kv_bf16_kernel<<<blocks_for(n), kThreads, 0, stream>>>(dst, src, t, t_max, dh, n);
   check_hip(hipGetLastError(), "mha_write_kv");
 }
 
@@ -396,6 +412,49 @@ void MultiHeadAttention::lay_qkv(const Tensor& q, const Tensor& k, const Tensor&
   const int64_t kv_n = static_cast<int64_t>(n) * time * kv_dim_;
   const int64_t full_n = static_cast<int64_t>(n) * heads * time * dh;
   hipStream_t stream = stream_of(*ctx_);
+  if (q_heads_->dtype() == DType::BFloat16) {
+    arena_reset(*ctx_);
+    float* qf = stage_f32(*ctx_, q);
+    float* kf = stage_f32(*ctx_, k);
+    float* vf = stage_f32(*ctx_, v);
+    float* qh = arena_f32(*ctx_, q_n);
+    launch_split_heads(stream, qh, qf, time, heads, dh, q_n);
+    if (group == 1) {
+      float* kh = arena_f32(*ctx_, kv_n);
+      float* vh = arena_f32(*ctx_, kv_n);
+      launch_split_heads(stream, kh, kf, time, kv, dh, kv_n);
+      launch_split_heads(stream, vh, vf, time, kv, dh, kv_n);
+      keep_f32(*ctx_, *q_heads_, qh);
+      keep_f32(*ctx_, *k_heads_, kh);
+      keep_f32(*ctx_, *v_heads_, vh);
+    } else {
+      ensure_activation(k_kv_, *ctx_, {n, kv, time, dh});
+      ensure_activation(v_kv_, *ctx_, {n, kv, time, dh});
+      float* kkv = arena_f32(*ctx_, kv_n);
+      float* vkv = arena_f32(*ctx_, kv_n);
+      launch_split_heads(stream, kkv, kf, time, kv, dh, kv_n);
+      launch_split_heads(stream, vkv, vf, time, kv, dh, kv_n);
+      keep_f32(*ctx_, *q_heads_, qh);
+      keep_f32(*ctx_, *k_kv_, kkv);
+      keep_f32(*ctx_, *v_kv_, vkv);
+    }
+    if (q_norm_) q_heads_->copy_from(q_norm_->forward(*q_heads_));
+    if (group == 1) {
+      if (k_norm_) k_heads_->copy_from(k_norm_->forward(*k_heads_));
+    } else {
+      if (k_norm_) k_kv_->copy_from(k_norm_->forward(*k_kv_));
+      arena_reset(*ctx_);
+      float* ks = stage_f32(*ctx_, *k_kv_);
+      float* vs = stage_f32(*ctx_, *v_kv_);
+      float* kh = arena_f32(*ctx_, full_n);
+      float* vh = arena_f32(*ctx_, full_n);
+      launch_repeat_kv(stream, kh, ks, time, kv, group, dh, full_n);
+      launch_repeat_kv(stream, vh, vs, time, kv, group, dh, full_n);
+      keep_f32(*ctx_, *k_heads_, kh);
+      keep_f32(*ctx_, *v_heads_, vh);
+    }
+    return;
+  }
   launch_split_heads(stream, q_heads_->data(), q.data(), time, heads, dh, q_n);
   if (q_norm_) q_heads_->copy_from(q_norm_->forward(*q_heads_));
   if (group == 1) {
@@ -403,8 +462,8 @@ void MultiHeadAttention::lay_qkv(const Tensor& q, const Tensor& k, const Tensor&
     launch_split_heads(stream, v_heads_->data(), v.data(), time, kv, dh, kv_n);
     if (k_norm_) k_heads_->copy_from(k_norm_->forward(*k_heads_));
   } else {
-    ensure_tensor(k_kv_, *ctx_, {n, kv, time, dh});
-    ensure_tensor(v_kv_, *ctx_, {n, kv, time, dh});
+    ensure_activation(k_kv_, *ctx_, {n, kv, time, dh});
+    ensure_activation(v_kv_, *ctx_, {n, kv, time, dh});
     launch_split_heads(stream, k_kv_->data(), k.data(), time, kv, dh, kv_n);
     launch_split_heads(stream, v_kv_->data(), v.data(), time, kv, dh, kv_n);
     if (k_norm_) k_kv_->copy_from(k_norm_->forward(*k_kv_));
@@ -427,14 +486,49 @@ const Tensor& MultiHeadAttention::forward(const Tensor& input) {
   const std::vector<int> merged_shape = {n, time, q_dim_};
   const int64_t full_n = static_cast<int64_t>(n) * heads * time * dh;
 
-  ensure_tensor(q_heads_, *ctx_, heads_shape);
-  ensure_tensor(k_heads_, *ctx_, heads_shape);
-  ensure_tensor(v_heads_, *ctx_, heads_shape);
-  ensure_tensor(scores_, *ctx_, score_shape);
-  ensure_tensor(attn_, *ctx_, score_shape);
-  ensure_tensor(context_, *ctx_, heads_shape);
-  ensure_tensor(merged_, *ctx_, merged_shape);
-  ensure_tensor(output_, *ctx_, shape);
+  ensure_activation(q_heads_, *ctx_, heads_shape);
+  ensure_activation(k_heads_, *ctx_, heads_shape);
+  ensure_activation(v_heads_, *ctx_, heads_shape);
+  ensure_activation(scores_, *ctx_, score_shape);
+  ensure_activation(attn_, *ctx_, score_shape);
+  ensure_activation(context_, *ctx_, heads_shape);
+  ensure_activation(merged_, *ctx_, merged_shape);
+  ensure_activation(output_, *ctx_, shape);
+
+  if (output_->dtype() == DType::BFloat16) {
+    hipStream_t stream = stream_of(*ctx_);
+    lay_qkv(q_->forward(input), k_->forward(input), v_->forward(input), time);
+    if (use_rope_) {
+      arena_reset(*ctx_);
+      float* qh = stage_f32(*ctx_, *q_heads_);
+      float* kh = stage_f32(*ctx_, *k_heads_);
+      launch_rope(stream, qh, kh, time, dh, 0, full_n, false, rope_theta_);
+      keep_f32(*ctx_, *q_heads_, qh);
+      keep_f32(*ctx_, *k_heads_, kh);
+    }
+    const float scale = 1.f / std::sqrt(static_cast<float>(dh));
+    const int64_t stride_qk = static_cast<int64_t>(time) * dh;
+    const int64_t stride_s = static_cast<int64_t>(time) * time;
+    gemm_nt_bf16(*ctx_, scores_->bf16_data(), true, stage_bf16(*ctx_, *q_heads_),
+                 stage_bf16(*ctx_, *k_heads_), time, time, dh, batch, time, dh, dh, stride_s, stride_qk,
+                 stride_qk, scale, 0.f);
+    arena_reset(*ctx_);
+    float* scores_f = stage_f32(*ctx_, *scores_);
+    float* attn_f = arena_f32(*ctx_, scores_->numel());
+    softmax_rows_kernel<<<batch * time, kThreads, 0, stream>>>(attn_f, scores_f, time, causal_ ? 1 : 0);
+    check_hip(hipGetLastError(), "mha_softmax");
+    keep_f32(*ctx_, *attn_, attn_f);
+    gemm_nn_bf16(*ctx_, context_->bf16_data(), true, stage_bf16(*ctx_, *attn_),
+                 stage_bf16(*ctx_, *v_heads_), time, dh, time, batch, dh, time, dh, stride_qk, stride_s,
+                 stride_qk, 1.f, 0.f);
+    arena_reset(*ctx_);
+    float* context_f = stage_f32(*ctx_, *context_);
+    float* merged_f = arena_f32(*ctx_, merged_->numel());
+    launch_merge_heads(stream, merged_f, context_f, time, heads, dh, full_n);
+    keep_f32(*ctx_, *merged_, merged_f);
+    output_->copy_from(out_->forward(*merged_));
+    return *output_;
+  }
 
   hipStream_t stream = stream_of(*ctx_);
   hipblasHandle_t handle = hipblas_of(*ctx_);
@@ -459,8 +553,9 @@ const Tensor& MultiHeadAttention::forward(const Tensor& input) {
 void MultiHeadAttention::reset_cache(Cache& cache, int batch, int t_max) const {
   if (batch < 1) throw std::invalid_argument("batch");
   if (t_max < 1) throw std::invalid_argument("t_max");
-  cache.k = Tensor(*ctx_, {batch, num_heads_, t_max, head_dim_});
-  cache.v = Tensor(*ctx_, {batch, num_heads_, t_max, head_dim_});
+  const DType dtype = ctx_->activation_dtype();
+  cache.k = Tensor(*ctx_, {batch, num_heads_, t_max, head_dim_}, dtype);
+  cache.v = Tensor(*ctx_, {batch, num_heads_, t_max, head_dim_}, dtype);
   cache.k.zero();
   cache.v.zero();
   cache.t = 0;
@@ -493,14 +588,51 @@ const Tensor& MultiHeadAttention::forward_cached(const Tensor& x_t, Cache& cache
   const std::vector<int> flat_shape = x_t.shape();
   const std::vector<int> merged_shape = {n, tq, q_dim_};
 
-  ensure_tensor(q_heads_, *ctx_, q_shape);
-  ensure_tensor(k_heads_, *ctx_, q_shape);
-  ensure_tensor(v_heads_, *ctx_, q_shape);
-  ensure_tensor(scores_, *ctx_, score_shape);
-  ensure_tensor(attn_, *ctx_, score_shape);
-  ensure_tensor(context_, *ctx_, q_shape);
-  ensure_tensor(merged_, *ctx_, merged_shape);
-  ensure_tensor(output_, *ctx_, flat_shape);
+  ensure_activation(q_heads_, *ctx_, q_shape);
+  ensure_activation(k_heads_, *ctx_, q_shape);
+  ensure_activation(v_heads_, *ctx_, q_shape);
+  ensure_activation(scores_, *ctx_, score_shape);
+  ensure_activation(attn_, *ctx_, score_shape);
+  ensure_activation(context_, *ctx_, q_shape);
+  ensure_activation(merged_, *ctx_, merged_shape);
+  ensure_activation(output_, *ctx_, flat_shape);
+
+  if (output_->dtype() == DType::BFloat16) {
+    hipStream_t stream = stream_of(*ctx_);
+    lay_qkv(q_->forward(x_t), k_->forward(x_t), v_->forward(x_t), tq);
+    if (use_rope_) {
+      arena_reset(*ctx_);
+      float* qh = stage_f32(*ctx_, *q_heads_);
+      float* kh = stage_f32(*ctx_, *k_heads_);
+      launch_rope(stream, qh, kh, tq, dh, t, full_n, false, rope_theta_);
+      keep_f32(*ctx_, *q_heads_, qh);
+      keep_f32(*ctx_, *k_heads_, kh);
+    }
+    const int64_t kv_n = static_cast<int64_t>(batch) * dh;
+    launch_write_kv_bf16(stream, cache.k.bf16_data(), k_heads_->bf16_data(), t, t_max, dh, kv_n);
+    launch_write_kv_bf16(stream, cache.v.bf16_data(), v_heads_->bf16_data(), t, t_max, dh, kv_n);
+    const float scale = 1.f / std::sqrt(static_cast<float>(dh));
+    gemm_nt_bf16(*ctx_, scores_->bf16_data(), true, stage_bf16(*ctx_, *q_heads_), stage_bf16(*ctx_, cache.k),
+                 tq, tk, dh, batch, tk, dh, dh, static_cast<int64_t>(tq) * tk,
+                 static_cast<int64_t>(tq) * dh, static_cast<int64_t>(t_max) * dh, scale, 0.f);
+    arena_reset(*ctx_);
+    float* scores_f = stage_f32(*ctx_, *scores_);
+    float* attn_f = arena_f32(*ctx_, scores_->numel());
+    softmax_rows_kernel<<<batch, kThreads, 0, stream>>>(attn_f, scores_f, tk, 0);
+    check_hip(hipGetLastError(), "mha_softmax");
+    keep_f32(*ctx_, *attn_, attn_f);
+    gemm_nn_bf16(*ctx_, context_->bf16_data(), true, stage_bf16(*ctx_, *attn_), stage_bf16(*ctx_, cache.v),
+                 tq, dh, tk, batch, dh, tk, dh, static_cast<int64_t>(tq) * dh,
+                 static_cast<int64_t>(tq) * tk, static_cast<int64_t>(t_max) * dh, 1.f, 0.f);
+    arena_reset(*ctx_);
+    float* context_f = stage_f32(*ctx_, *context_);
+    float* merged_f = arena_f32(*ctx_, merged_->numel());
+    launch_merge_heads(stream, merged_f, context_f, tq, heads, dh, full_n);
+    keep_f32(*ctx_, *merged_, merged_f);
+    output_->copy_from(out_->forward(*merged_));
+    cache.t = tk;
+    return *output_;
+  }
 
   hipStream_t stream = stream_of(*ctx_);
   hipblasHandle_t handle = hipblas_of(*ctx_);
@@ -562,21 +694,120 @@ const Tensor& MultiHeadAttention::backward(const Tensor& grad_output) {
   const int64_t q_n = static_cast<int64_t>(n) * time * q_dim_;
   const int64_t kv_n = static_cast<int64_t>(n) * time * kv_dim_;
 
-  ensure_tensor(d_context_, *ctx_, heads_shape);
-  ensure_tensor(d_attn_, *ctx_, score_shape);
-  ensure_tensor(d_scores_, *ctx_, score_shape);
-  ensure_tensor(d_q_, *ctx_, heads_shape);
-  ensure_tensor(d_k_, *ctx_, heads_shape);
-  ensure_tensor(d_v_, *ctx_, heads_shape);
-  ensure_tensor(q_flat_grad_, *ctx_, {n, time, q_dim_});
-  ensure_tensor(kv_flat_grad_, *ctx_, {n, time, kv_dim_});
-  ensure_tensor(grad_pair_, *ctx_, flat_shape);
-  ensure_tensor(grad_input_, *ctx_, flat_shape);
+  ensure_activation(d_context_, *ctx_, heads_shape);
+  ensure_activation(d_attn_, *ctx_, score_shape);
+  ensure_activation(d_scores_, *ctx_, score_shape);
+  ensure_activation(d_q_, *ctx_, heads_shape);
+  ensure_activation(d_k_, *ctx_, heads_shape);
+  ensure_activation(d_v_, *ctx_, heads_shape);
+  ensure_activation(q_flat_grad_, *ctx_, {n, time, q_dim_});
+  ensure_activation(kv_flat_grad_, *ctx_, {n, time, kv_dim_});
+  ensure_activation(grad_pair_, *ctx_, flat_shape);
+  ensure_activation(grad_input_, *ctx_, flat_shape);
+
+  const int64_t hidden = grad_output.numel();
+  const float scale = 1.f / std::sqrt(static_cast<float>(dh));
+  if (grad_input_->dtype() == DType::BFloat16) {
+    const Tensor& d_merged = out_->backward(grad_output);
+    hipStream_t stream = stream_of(*ctx_);
+    const int64_t stride_qk = static_cast<int64_t>(time) * dh;
+    const int64_t stride_s = static_cast<int64_t>(time) * time;
+    arena_reset(*ctx_);
+    float* merged_f = stage_f32(*ctx_, d_merged);
+    float* d_context_f = arena_f32(*ctx_, d_context_->numel());
+    launch_split_heads(stream, d_context_f, merged_f, time, heads, dh, q_n);
+    keep_f32(*ctx_, *d_context_, d_context_f);
+    gemm_nt_bf16(*ctx_, d_attn_->bf16_data(), true, stage_bf16(*ctx_, *d_context_),
+                 stage_bf16(*ctx_, *v_heads_), time, time, dh, batch, time, dh, dh, stride_s, stride_qk,
+                 stride_qk, 1.f, 0.f);
+    gemm_tn_bf16(*ctx_, d_v_->bf16_data(), true, stage_bf16(*ctx_, *attn_),
+                 stage_bf16(*ctx_, *d_context_), time, dh, time, batch, dh, time, dh, stride_qk, stride_s,
+                 stride_qk, 1.f, 0.f);
+    arena_reset(*ctx_);
+    float* probs = stage_f32(*ctx_, *attn_);
+    float* dp = stage_f32(*ctx_, *d_attn_);
+    float* ds = arena_f32(*ctx_, d_scores_->numel());
+    softmax_backward_kernel<<<batch * time, kThreads, 0, stream>>>(ds, probs, dp, time, causal_ ? 1 : 0);
+    check_hip(hipGetLastError(), "mha_softmax_backward");
+    keep_f32(*ctx_, *d_scores_, ds);
+    gemm_nn_bf16(*ctx_, d_q_->bf16_data(), true, stage_bf16(*ctx_, *d_scores_),
+                 stage_bf16(*ctx_, *k_heads_), time, dh, time, batch, dh, time, dh, stride_qk, stride_s,
+                 stride_qk, scale, 0.f);
+    gemm_tn_bf16(*ctx_, d_k_->bf16_data(), true, stage_bf16(*ctx_, *d_scores_),
+                 stage_bf16(*ctx_, *q_heads_), time, dh, time, batch, dh, time, dh, stride_qk, stride_s,
+                 stride_qk, scale, 0.f);
+    if (use_rope_) {
+      arena_reset(*ctx_);
+      float* dq = stage_f32(*ctx_, *d_q_);
+      float* dk = stage_f32(*ctx_, *d_k_);
+      launch_rope(stream, dq, dk, time, dh, 0, full_n, true, rope_theta_);
+      keep_f32(*ctx_, *d_q_, dq);
+      keep_f32(*ctx_, *d_k_, dk);
+    }
+
+    const Tensor* dq_src = &*d_q_;
+    if (q_norm_) dq_src = &q_norm_->backward(*d_q_);
+    arena_reset(*ctx_);
+    float* dq_f = stage_f32(*ctx_, *dq_src);
+    float* q_flat = arena_f32(*ctx_, q_flat_grad_->numel());
+    launch_merge_heads(stream, q_flat, dq_f, time, heads, dh, q_n);
+    keep_f32(*ctx_, *q_flat_grad_, q_flat);
+    const Tensor& gq = q_->backward(*q_flat_grad_);
+
+    const Tensor* dk_src = &*d_k_;
+    if (group > 1) {
+      ensure_activation(k_kv_, *ctx_, {n, kv, time, dh});
+      const int64_t kv_heads_n = static_cast<int64_t>(n) * kv * time * dh;
+      arena_reset(*ctx_);
+      float* src = stage_f32(*ctx_, *d_k_);
+      float* summed = arena_f32(*ctx_, kv_heads_n);
+      launch_sum_kv(stream, summed, src, time, kv, group, dh, kv_heads_n);
+      keep_f32(*ctx_, *k_kv_, summed);
+      dk_src = &*k_kv_;
+      if (k_norm_) dk_src = &k_norm_->backward(*k_kv_);
+    } else if (k_norm_) {
+      dk_src = &k_norm_->backward(*d_k_);
+    }
+    arena_reset(*ctx_);
+    float* dk_f = stage_f32(*ctx_, *dk_src);
+    float* kv_flat = arena_f32(*ctx_, kv_flat_grad_->numel());
+    launch_merge_heads(stream, kv_flat, dk_f, time, kv, dh, kv_n);
+    keep_f32(*ctx_, *kv_flat_grad_, kv_flat);
+    const Tensor& gk = k_->backward(*kv_flat_grad_);
+
+    const Tensor* dv_src = &*d_v_;
+    if (group > 1) {
+      ensure_activation(v_kv_, *ctx_, {n, kv, time, dh});
+      const int64_t kv_heads_n = static_cast<int64_t>(n) * kv * time * dh;
+      arena_reset(*ctx_);
+      float* src = stage_f32(*ctx_, *d_v_);
+      float* summed = arena_f32(*ctx_, kv_heads_n);
+      launch_sum_kv(stream, summed, src, time, kv, group, dh, kv_heads_n);
+      keep_f32(*ctx_, *v_kv_, summed);
+      dv_src = &*v_kv_;
+    }
+    arena_reset(*ctx_);
+    float* dv_f = stage_f32(*ctx_, *dv_src);
+    float* v_flat = arena_f32(*ctx_, kv_flat_grad_->numel());
+    launch_merge_heads(stream, v_flat, dv_f, time, kv, dh, kv_n);
+    keep_f32(*ctx_, *kv_flat_grad_, v_flat);
+    const Tensor& gv = v_->backward(*kv_flat_grad_);
+
+    arena_reset(*ctx_);
+    float* gq_f = stage_f32(*ctx_, gq);
+    float* gk_f = stage_f32(*ctx_, gk);
+    float* gv_f = stage_f32(*ctx_, gv);
+    float* pair = arena_f32(*ctx_, hidden);
+    float* dx = arena_f32(*ctx_, hidden);
+    launch_add2(stream, pair, gq_f, gk_f, hidden);
+    launch_add2(stream, dx, pair, gv_f, hidden);
+    keep_f32(*ctx_, *grad_pair_, pair);
+    keep_f32(*ctx_, *grad_input_, dx);
+    return *grad_input_;
+  }
 
   hipStream_t stream = stream_of(*ctx_);
   hipblasHandle_t handle = hipblas_of(*ctx_);
-  const int64_t hidden = grad_output.numel();
-  const float scale = 1.f / std::sqrt(static_cast<float>(dh));
 
   const Tensor& d_merged = out_->backward(grad_output);
   launch_split_heads(stream, d_context_->data(), d_merged.data(), time, heads, dh, q_n);
@@ -601,7 +832,7 @@ const Tensor& MultiHeadAttention::backward(const Tensor& grad_output) {
 
   const float* dk = d_k_->data();
   if (group > 1) {
-    ensure_tensor(k_kv_, *ctx_, {n, kv, time, dh});
+    ensure_activation(k_kv_, *ctx_, {n, kv, time, dh});
     const int64_t kv_heads_n = static_cast<int64_t>(n) * kv * time * dh;
     launch_sum_kv(stream, k_kv_->data(), d_k_->data(), time, kv, group, dh, kv_heads_n);
     dk = k_kv_->data();
@@ -614,7 +845,7 @@ const Tensor& MultiHeadAttention::backward(const Tensor& grad_output) {
 
   const float* dv = d_v_->data();
   if (group > 1) {
-    ensure_tensor(v_kv_, *ctx_, {n, kv, time, dh});
+    ensure_activation(v_kv_, *ctx_, {n, kv, time, dh});
     const int64_t kv_heads_n = static_cast<int64_t>(n) * kv * time * dh;
     launch_sum_kv(stream, v_kv_->data(), d_v_->data(), time, kv, group, dh, kv_heads_n);
     dv = v_kv_->data();

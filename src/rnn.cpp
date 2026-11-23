@@ -1,5 +1,6 @@
 #include "nn/layers/rnn.hpp"
 
+#include "activate.hpp"
 #include "check.hpp"
 #include "context_impl.hpp"
 #include "ensure.hpp"
@@ -94,18 +95,37 @@ const Tensor& RNN::forward(const Tensor& input) {
   if (input.rank() != 3 || input.shape()[2] != input_size_) throw Error("RNN input shape");
   const int n = input.shape()[0];
   const int time = input.shape()[1];
-  ensure_tensor(cache_x_, *ctx_, input.shape());
-  ensure_tensor(output_, *ctx_, {n, time, hidden_size_});
+  ensure_activation(cache_x_, *ctx_, input.shape());
+  ensure_activation(output_, *ctx_, {n, time, hidden_size_});
   ensure_tensor(x_t_, *ctx_, {n, input_size_});
   ensure_tensor(h_t_, *ctx_, {n, hidden_size_});
   ensure_tensor(h_prev_, *ctx_, {n, hidden_size_});
   ensure_tensor(pre_, *ctx_, {n, hidden_size_});
-  cache_x_->copy_from(input);
-  h_prev_->zero();
-
   hipblasHandle_t handle = hipblas_of(*ctx_);
   hipStream_t stream = stream_of(*ctx_);
   const int64_t hidden_count = static_cast<int64_t>(n) * hidden_size_;
+  if (output_->dtype() == DType::BFloat16) {
+    arena_reset(*ctx_);
+    float* x_all = stage_f32(*ctx_, input);
+    float* y_all = arena_f32(*ctx_, output_->numel());
+    h_prev_->zero();
+    for (int t = 0; t < time; ++t) {
+      launch_gather_time(stream, x_t_->data(), x_all, n, time, input_size_, t);
+      gemm_xh(handle, weight_ih_, *x_t_, *pre_, 0.f);
+      launch_add_bias(stream, pre_->data(), bias_ih_.data(), n, hidden_size_);
+      gemm_xh(handle, weight_hh_, *h_prev_, *pre_, 1.f);
+      launch_add_bias(stream, pre_->data(), bias_hh_.data(), n, hidden_size_);
+      launch_tanh(stream, h_t_->data(), pre_->data(), hidden_count);
+      launch_scatter_time(stream, y_all, h_t_->data(), n, time, hidden_size_, t);
+      h_prev_->copy_from(*h_t_);
+    }
+    keep_f32(*ctx_, *cache_x_, x_all);
+    keep_f32(*ctx_, *output_, y_all);
+    return *output_;
+  }
+  cache_x_->copy_from(input);
+  h_prev_->zero();
+
   for (int t = 0; t < time; ++t) {
     launch_gather_time(stream, x_t_->data(), cache_x_->data(), n, time, input_size_, t);
     gemm_xh(handle, weight_ih_, *x_t_, *pre_, 0.f);
@@ -125,7 +145,7 @@ const Tensor& RNN::backward(const Tensor& grad_output) {
   }
   const int n = cache_x_->shape()[0];
   const int time = cache_x_->shape()[1];
-  ensure_tensor(grad_input_, *ctx_, cache_x_->shape());
+  ensure_activation(grad_input_, *ctx_, cache_x_->shape());
   ensure_tensor(x_t_, *ctx_, {n, input_size_});
   ensure_tensor(h_t_, *ctx_, {n, hidden_size_});
   ensure_tensor(h_prev_, *ctx_, {n, hidden_size_});
@@ -134,6 +154,38 @@ const Tensor& RNN::backward(const Tensor& grad_output) {
   ensure_tensor(grad_y_t_, *ctx_, {n, hidden_size_});
   ensure_tensor(grad_h_next_, *ctx_, {n, hidden_size_});
   ensure_tensor(grad_x_t_, *ctx_, {n, input_size_});
+  if (grad_input_->dtype() == DType::BFloat16) {
+    arena_reset(*ctx_);
+    float* dy_all = stage_f32(*ctx_, grad_output);
+    float* y_all = stage_f32(*ctx_, *output_);
+    float* x_all = stage_f32(*ctx_, *cache_x_);
+    float* dx_all = arena_f32(*ctx_, grad_input_->numel());
+    hipblasHandle_t handle = hipblas_of(*ctx_);
+    hipStream_t stream = stream_of(*ctx_);
+    const int64_t hidden_count = static_cast<int64_t>(n) * hidden_size_;
+    grad_h_next_->zero();
+    for (int t = time - 1; t >= 0; --t) {
+      launch_gather_time(stream, grad_y_t_->data(), dy_all, n, time, hidden_size_, t);
+      launch_add2(stream, grad_h_->data(), grad_y_t_->data(), grad_h_next_->data(), hidden_count);
+      launch_gather_time(stream, h_t_->data(), y_all, n, time, hidden_size_, t);
+      launch_tanh_backward(stream, grad_a_->data(), h_t_->data(), grad_h_->data(), hidden_count);
+      launch_gather_time(stream, x_t_->data(), x_all, n, time, input_size_, t);
+      if (t == 0) {
+        h_prev_->zero();
+      } else {
+        launch_gather_time(stream, h_prev_->data(), y_all, n, time, hidden_size_, t - 1);
+      }
+      gemm_grad_weight(handle, *x_t_, *grad_a_, grad_weight_ih_);
+      gemm_grad_weight(handle, *h_prev_, *grad_a_, grad_weight_hh_);
+      launch_bias_grad(stream, grad_a_->data(), grad_bias_ih_.data(), n, hidden_size_);
+      launch_bias_grad(stream, grad_a_->data(), grad_bias_hh_.data(), n, hidden_size_);
+      gemm_grad_input(handle, weight_ih_, *grad_a_, *grad_x_t_);
+      launch_scatter_time(stream, dx_all, grad_x_t_->data(), n, time, input_size_, t);
+      gemm_grad_input(handle, weight_hh_, *grad_a_, *grad_h_next_);
+    }
+    keep_f32(*ctx_, *grad_input_, dx_all);
+    return *grad_input_;
+  }
   grad_h_next_->zero();
 
   hipblasHandle_t handle = hipblas_of(*ctx_);

@@ -1,5 +1,6 @@
 #include "nn/layers/relu.hpp"
 
+#include "activate.hpp"
 #include "check.hpp"
 #include "context_impl.hpp"
 #include "ensure.hpp"
@@ -59,11 +60,25 @@ void ReLU::zero_grad() {}
 
 const Tensor& ReLU::forward(const Tensor& input) {
   require_rank(input.shape());
-  ensure_tensor(cache_x_, *ctx_, input.shape());
-  ensure_tensor(output_, *ctx_, input.shape());
-  cache_x_->copy_from(input);
-  const int64_t n = cache_x_->numel();
+  ensure_activation(cache_x_, *ctx_, input.shape());
+  ensure_activation(output_, *ctx_, input.shape());
+  const int64_t n = input.numel();
   hipStream_t stream = stream_of(*ctx_);
+  if (output_->dtype() == DType::BFloat16) {
+    arena_reset(*ctx_);
+    float* x = stage_f32(*ctx_, input);
+    float* y = arena_f32(*ctx_, n);
+    if (aligned16(y) && aligned16(x) && (n % 4) == 0) {
+      relu4_kernel<<<blocks_for(n / 4), 256, 0, stream>>>(y, x, n / 4);
+    } else {
+      relu_kernel<<<blocks_for(n), 256, 0, stream>>>(y, x, n);
+    }
+    check_hip(hipGetLastError(), "relu");
+    keep_f32(*ctx_, *cache_x_, x);
+    keep_f32(*ctx_, *output_, y);
+    return *output_;
+  }
+  cache_x_->copy_from(input);
   if (aligned16(output_->data()) && aligned16(cache_x_->data()) && (n % 4) == 0) {
     relu4_kernel<<<blocks_for(n / 4), 256, 0, stream>>>(output_->data(), cache_x_->data(), n / 4);
   } else {
@@ -75,9 +90,23 @@ const Tensor& ReLU::forward(const Tensor& input) {
 
 const Tensor& ReLU::backward(const Tensor& grad_output) {
   if (!cache_x_ || !output_ || grad_output.shape() != output_->shape()) throw Error("ReLU backward shape");
-  ensure_tensor(grad_input_, *ctx_, grad_output.shape());
+  ensure_activation(grad_input_, *ctx_, grad_output.shape());
   const int64_t n = cache_x_->numel();
   hipStream_t stream = stream_of(*ctx_);
+  if (grad_input_->dtype() == DType::BFloat16) {
+    arena_reset(*ctx_);
+    float* x = stage_f32(*ctx_, *cache_x_);
+    float* dy = stage_f32(*ctx_, grad_output);
+    float* dx = arena_f32(*ctx_, n);
+    if (aligned16(dx) && aligned16(x) && aligned16(dy) && (n % 4) == 0) {
+      relu_bwd4_kernel<<<blocks_for(n / 4), 256, 0, stream>>>(dx, x, dy, n / 4);
+    } else {
+      relu_bwd_kernel<<<blocks_for(n), 256, 0, stream>>>(dx, x, dy, n);
+    }
+    check_hip(hipGetLastError(), "relu_backward");
+    keep_f32(*ctx_, *grad_input_, dx);
+    return *grad_input_;
+  }
   if (aligned16(grad_input_->data()) && aligned16(cache_x_->data()) && aligned16(grad_output.data()) &&
       (n % 4) == 0) {
     relu_bwd4_kernel<<<blocks_for(n / 4), 256, 0, stream>>>(grad_input_->data(), cache_x_->data(),

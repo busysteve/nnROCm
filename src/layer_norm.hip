@@ -1,5 +1,6 @@
 #include "nn/layers/layer_norm.hpp"
 
+#include "activate.hpp"
 #include "check.hpp"
 #include "context_impl.hpp"
 #include "ensure.hpp"
@@ -230,10 +231,21 @@ void LayerNorm::zero_grad() {
 const Tensor& LayerNorm::forward(const Tensor& input) {
   const int rows = normalized_rows(input, normalized_shape_);
   const std::vector<int>& shape = input.shape();
-  ensure_tensor(cache_x_, *ctx_, shape);
-  ensure_tensor(output_, *ctx_, shape);
+  ensure_activation(cache_x_, *ctx_, shape);
+  ensure_activation(output_, *ctx_, shape);
   ensure_tensor(mean_, *ctx_, std::vector<int>{rows});
   ensure_tensor(inv_std_, *ctx_, std::vector<int>{rows});
+  if (output_->dtype() == DType::BFloat16) {
+    arena_reset(*ctx_);
+    float* x = stage_f32(*ctx_, input);
+    float* y = arena_f32(*ctx_, input.numel());
+    layer_norm_forward_kernel<<<rows, kThreads, 0, stream_of(*ctx_)>>>(
+        y, mean_->data(), inv_std_->data(), x, weight_.data(), bias_.data(), normalized_shape_, eps_);
+    check_hip(hipGetLastError(), "layer_norm_forward");
+    keep_f32(*ctx_, *cache_x_, x);
+    keep_f32(*ctx_, *output_, y);
+    return *output_;
+  }
   cache_x_->copy_from(input);
   layer_norm_forward_kernel<<<rows, kThreads, 0, stream_of(*ctx_)>>>(
       output_->data(), mean_->data(), inv_std_->data(), cache_x_->data(), weight_.data(),
@@ -247,8 +259,24 @@ const Tensor& LayerNorm::backward(const Tensor& grad_output) {
     throw Error("LayerNorm backward shape");
   }
   const int rows = static_cast<int>(mean_->numel());
-  ensure_tensor(grad_input_, *ctx_, cache_x_->shape());
+  ensure_activation(grad_input_, *ctx_, cache_x_->shape());
   hipStream_t stream = stream_of(*ctx_);
+  if (grad_input_->dtype() == DType::BFloat16) {
+    arena_reset(*ctx_);
+    float* x = stage_f32(*ctx_, *cache_x_);
+    float* dy = stage_f32(*ctx_, grad_output);
+    float* dx = arena_f32(*ctx_, cache_x_->numel());
+    layer_norm_backward_input_kernel<<<rows, kThreads, 0, stream>>>(
+        dx, dy, x, mean_->data(), inv_std_->data(), weight_.data(), normalized_shape_);
+    check_hip(hipGetLastError(), "layer_norm_backward_input");
+    const int param_blocks = (normalized_shape_ + kThreads - 1) / kThreads;
+    layer_norm_param_grad_kernel<<<param_blocks, kThreads, 0, stream>>>(
+        dy, x, mean_->data(), inv_std_->data(), grad_weight_.data(), grad_bias_.data(), rows,
+        normalized_shape_);
+    check_hip(hipGetLastError(), "layer_norm_backward_param");
+    keep_f32(*ctx_, *grad_input_, dx);
+    return *grad_input_;
+  }
   layer_norm_backward_input_kernel<<<rows, kThreads, 0, stream>>>(
       grad_input_->data(), grad_output.data(), cache_x_->data(), mean_->data(), inv_std_->data(),
       weight_.data(), normalized_shape_);

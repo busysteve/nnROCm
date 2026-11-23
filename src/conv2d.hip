@@ -1,5 +1,6 @@
 #include "nn/layers/conv2d.hpp"
 
+#include "activate.hpp"
 #include "check.hpp"
 #include "context_impl.hpp"
 #include "ensure.hpp"
@@ -208,8 +209,8 @@ void Conv2d::prepare(int n, int h, int w) {
       workspace_bytes_ = need;
     }
   }
-  ensure_tensor(output_, *ctx_, {n, out_channels_, ho, wo});
-  ensure_tensor(grad_input_, *ctx_, {n, in_channels_, h, w});
+  ensure_activation(output_, *ctx_, {n, out_channels_, ho, wo});
+  ensure_activation(grad_input_, *ctx_, {n, in_channels_, h, w});
 }
 
 const Tensor& Conv2d::forward(const Tensor& input) {
@@ -218,8 +219,7 @@ const Tensor& Conv2d::forward(const Tensor& input) {
   const int h = input.shape()[2];
   const int w = input.shape()[3];
   prepare(n, h, w);
-  ensure_tensor(cache_x_, *ctx_, input.shape());
-  cache_x_->copy_from(input);
+  ensure_activation(cache_x_, *ctx_, input.shape());
 
   const int ho = output_->shape()[2];
   const int wo = output_->shape()[3];
@@ -236,25 +236,40 @@ const Tensor& Conv2d::forward(const Tensor& input) {
   hipStream_t stream = stream_of(*ctx_);
   hipblasHandle_t handle = hipblas_of(*ctx_);
   float* col = static_cast<float*>(workspace_);
+  float* x_base;
+  float* y_base;
+  if (output_->dtype() == DType::BFloat16) {
+    arena_reset(*ctx_);
+    x_base = stage_f32(*ctx_, input);
+    y_base = arena_f32(*ctx_, output_->numel());
+  } else {
+    cache_x_->copy_from(input);
+    x_base = cache_x_->data();
+    y_base = output_->data();
+  }
   for (int n0 = 0; n0 < n; n0 += chunk) {
     const int nb = std::min(chunk, n - n0);
-    const float* a = cache_x_->data() + static_cast<int64_t>(n0) * k_col * spatial;
+    const float* a = x_base + static_cast<int64_t>(n0) * k_col * spatial;
     if (!direct) {
       im2col_kernel<<<blocks_for(static_cast<int64_t>(nb) * k_col * spatial), 256, 0, stream>>>(
-          cache_x_->data(), col, n0, nb, in_channels_, h, w, ho, wo, kernel_, stride_, pad_);
+          x_base, col, n0, nb, in_channels_, h, w, ho, wo, kernel_, stride_, pad_);
       check_hip(hipGetLastError(), "im2col");
       a = col;
     }
     // Y_cm(spatial, OC) = Col_cm(spatial, K) * W_cm(K, OC). W row-major (OC, K) is that W_cm.
     gemm_batched(handle, HIPBLAS_OP_N, HIPBLAS_OP_N, spatial, out_channels_, k_col, a, spatial,
                  static_cast<hipblasStride>(k_col) * spatial, weight_.data(), k_col, 0, 0.f,
-                 output_->data() + static_cast<int64_t>(n0) * out_channels_ * spatial, spatial,
+                 y_base + static_cast<int64_t>(n0) * out_channels_ * spatial, spatial,
                  static_cast<hipblasStride>(out_channels_) * spatial, nb);
   }
   if (bias_) {
-    conv_bias_kernel<<<blocks_for(output_->numel()), 256, 0, stream>>>(
-        output_->data(), bias_->data(), n, out_channels_, spatial);
+    conv_bias_kernel<<<blocks_for(output_->numel()), 256, 0, stream>>>(y_base, bias_->data(), n,
+                                                                        out_channels_, spatial);
     check_hip(hipGetLastError(), "conv_bias");
+  }
+  if (output_->dtype() == DType::BFloat16) {
+    keep_f32(*ctx_, *cache_x_, x_base);
+    keep_f32(*ctx_, *output_, y_base);
   }
   return *output_;
 }
@@ -282,42 +297,56 @@ const Tensor& Conv2d::backward(const Tensor& grad_output) {
   hipblasHandle_t handle = hipblas_of(*ctx_);
   float* col = static_cast<float*>(workspace_);
   const int dw_count = out_channels_ * k_col;
+  float* x_base;
+  const float* dy_base;
+  float* dx_base;
+  if (grad_input_->dtype() == DType::BFloat16) {
+    arena_reset(*ctx_);
+    x_base = stage_f32(*ctx_, *cache_x_);
+    dy_base = stage_f32(*ctx_, grad_output);
+    dx_base = arena_f32(*ctx_, grad_input_->numel());
+  } else {
+    x_base = cache_x_->data();
+    dy_base = grad_output.data();
+    dx_base = grad_input_->data();
+  }
   for (int n0 = 0; n0 < n; n0 += chunk) {
     const int nb = std::min(chunk, n - n0);
     float* partial = col + (direct ? 0 : static_cast<int64_t>(nb) * k_col * spatial);
-    const float* a = cache_x_->data() + static_cast<int64_t>(n0) * k_col * spatial;
+    const float* a = x_base + static_cast<int64_t>(n0) * k_col * spatial;
     if (!direct) {
       im2col_kernel<<<blocks_for(static_cast<int64_t>(nb) * k_col * spatial), 256, 0, stream>>>(
-          cache_x_->data(), col, n0, nb, in_channels_, h, w, ho, wo, kernel_, stride_, pad_);
+          x_base, col, n0, nb, in_channels_, h, w, ho, wo, kernel_, stride_, pad_);
       check_hip(hipGetLastError(), "im2col");
       a = col;
     }
     // dW_cm(K, OC) = Col_cm(spatial, K)^T * dY_cm(spatial, OC), one matrix per image.
     gemm_batched(handle, HIPBLAS_OP_T, HIPBLAS_OP_N, k_col, out_channels_, spatial, a, spatial,
                  static_cast<hipblasStride>(k_col) * spatial,
-                 grad_output.data() + static_cast<int64_t>(n0) * out_channels_ * spatial, spatial,
+                 dy_base + static_cast<int64_t>(n0) * out_channels_ * spatial, spatial,
                  static_cast<hipblasStride>(out_channels_) * spatial, 0.f, partial, k_col,
                  static_cast<hipblasStride>(dw_count), nb);
     reduce_dw_kernel<<<blocks_for(dw_count), 256, 0, stream>>>(grad_weight_.data(), partial, nb, dw_count);
     check_hip(hipGetLastError(), "conv_dw");
 
-    float* dx = direct ? grad_input_->data() + static_cast<int64_t>(n0) * k_col * spatial : col;
+    float* dx = direct ? dx_base + static_cast<int64_t>(n0) * k_col * spatial : col;
     // dCol_cm(spatial, K) = dY_cm(spatial, OC) * W_cm(K, OC)^T.
     gemm_batched(handle, HIPBLAS_OP_N, HIPBLAS_OP_T, spatial, k_col, out_channels_,
-                 grad_output.data() + static_cast<int64_t>(n0) * out_channels_ * spatial, spatial,
+                 dy_base + static_cast<int64_t>(n0) * out_channels_ * spatial, spatial,
                  static_cast<hipblasStride>(out_channels_) * spatial, weight_.data(), k_col, 0, 0.f, dx,
                  spatial, static_cast<hipblasStride>(k_col) * spatial, nb);
     if (!direct) {
       col2im_kernel<<<blocks_for(static_cast<int64_t>(nb) * in_channels_ * h * w), 256, 0, stream>>>(
-          col, grad_input_->data(), n0, nb, in_channels_, h, w, ho, wo, kernel_, stride_, pad_);
+          col, dx_base, n0, nb, in_channels_, h, w, ho, wo, kernel_, stride_, pad_);
       check_hip(hipGetLastError(), "col2im");
     }
   }
   if (grad_bias_) {
-    conv_bias_grad_kernel<<<blocks_for(out_channels_), 256, 0, stream>>>(
-        grad_output.data(), grad_bias_->data(), n, out_channels_, spatial);
+    conv_bias_grad_kernel<<<blocks_for(out_channels_), 256, 0, stream>>>(dy_base, grad_bias_->data(), n,
+                                                                         out_channels_, spatial);
     check_hip(hipGetLastError(), "conv_bias_grad");
   }
+  if (grad_input_->dtype() == DType::BFloat16) keep_f32(*ctx_, *grad_input_, dx_base);
   return *grad_input_;
 }
 

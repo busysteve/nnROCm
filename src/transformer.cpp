@@ -1,5 +1,6 @@
 #include "nn/transformer.hpp"
 
+#include "activate.hpp"
 #include "check.hpp"
 #include "context_impl.hpp"
 #include "ensure.hpp"
@@ -37,15 +38,37 @@ void copy_ids(IndexTensor& dst, const std::vector<int64_t>& host, Context& ctx) 
 const Tensor& add_embeddings(Context& ctx, const Tensor& tok, const Tensor* pos, const Tensor* typ,
                              std::optional<Tensor>& dst, std::optional<Tensor>& scratch) {
   if (pos != nullptr && typ != nullptr) {
-    ensure_tensor(scratch, ctx, tok.shape());
+    ensure_activation(scratch, ctx, tok.shape());
+    ensure_activation(dst, ctx, tok.shape());
+    if (dst->dtype() == DType::BFloat16) {
+      arena_reset(ctx);
+      float* tok_f = stage_f32(ctx, tok);
+      float* pos_f = stage_f32(ctx, *pos);
+      float* typ_f = stage_f32(ctx, *typ);
+      float* scratch_f = arena_f32(ctx, tok.numel());
+      float* dst_f = arena_f32(ctx, tok.numel());
+      launch_add2(stream_of(ctx), scratch_f, tok_f, pos_f, tok.numel());
+      launch_add2(stream_of(ctx), dst_f, scratch_f, typ_f, tok.numel());
+      keep_f32(ctx, *scratch, scratch_f);
+      keep_f32(ctx, *dst, dst_f);
+      return *dst;
+    }
     launch_add2(stream_of(ctx), scratch->data(), tok.data(), pos->data(), tok.numel());
-    ensure_tensor(dst, ctx, tok.shape());
     launch_add2(stream_of(ctx), dst->data(), scratch->data(), typ->data(), tok.numel());
     return *dst;
   }
   if (pos != nullptr || typ != nullptr) {
     const Tensor& extra = pos != nullptr ? *pos : *typ;
-    ensure_tensor(dst, ctx, tok.shape());
+    ensure_activation(dst, ctx, tok.shape());
+    if (dst->dtype() == DType::BFloat16) {
+      arena_reset(ctx);
+      float* tok_f = stage_f32(ctx, tok);
+      float* extra_f = stage_f32(ctx, extra);
+      float* dst_f = arena_f32(ctx, tok.numel());
+      launch_add2(stream_of(ctx), dst_f, tok_f, extra_f, tok.numel());
+      keep_f32(ctx, *dst, dst_f);
+      return *dst;
+    }
     launch_add2(stream_of(ctx), dst->data(), tok.data(), extra.data(), tok.numel());
     return *dst;
   }
