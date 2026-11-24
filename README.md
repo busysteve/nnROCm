@@ -38,9 +38,10 @@ include/nn/           public headers
 include/nn/layers/    layer headers
 src/                  sources, private headers, and HIP kernels
 tests/                the acceptance suite
+docs/code-structure.md  how those files connect
 ```
 
-Everything is in namespace `nn`.
+Everything is in namespace `nn`. The file map and the transformer ownership diagram are in [docs/code-structure.md](docs/code-structure.md).
 
 ## Classes
 
