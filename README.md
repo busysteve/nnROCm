@@ -374,7 +374,7 @@ Input shape is `(N, T, input_size)`. Output shape is `(N, output_size)`. `T` is 
 | `max_seq_len` | Stored on the config and in the checkpoint. At least 1. The trunk forward does not read it. |
 | `dropout` | In `[0, 1)`. Any other value throws `dropout`. |
 | `tie_embeddings` | Must be false. `true` throws `tie_embeddings`. |
-| `bias` | When true, attention projections, the block linears, and `lm_head` have a bias. |
+| `bias` | When true, attention projections, the block linears, and `lm_head` have a bias. `split_bias` selects `qkv_bias`, `attn_out_bias`, `mlp_bias`, and `lm_head_bias` on their own. With `split_bias` false, those four follow `bias`. |
 | `activation` | `TransformerActivation::Gelu` (`1`) or `SwiGLU` (`2`). Any other value throws `activation`. |
 | `positional` | `LearnedAbsolute` (`1`) adds a position table and uses LayerNorm. `Rope` (`2`) uses RMSNorm and adjacent-pair RoPE on Q and K when the head dimension is even. An odd head dimension throws `use_rope`. Any other value throws `positional`. |
 
@@ -396,7 +396,7 @@ const nn::Tensor& hooked = model.forward(hidden);  // float (N, T, d_model) -> (
 
 `parameters()` is `tok_emb.weight`, then `pos_emb.weight` when the position table exists, then `network().parameters()` (`blocks.0.ln1.weight`, ..., `final_ln.weight`, `lm_head.weight`). A RoPE model has no `pos_emb.weight` and no norm bias. `network().parameters()` does not include `tok_emb`.
 
-`save(path, nullptr)` writes version 1, family 6, no optimizer block, and those parameters, including `tok_emb.weight` and, for learned absolute positions, `pos_emb.weight`. `save(path, sgd)` writes version 2 with `optimizer_present` 1 and optimizer kind `1` (SGD) followed by the SGD body. `save(path, adamw)` writes version 2 with optimizer kind `2` (AdamW) and the AdamW moments. The flattened groups must be `parameters()` in order. `save(path, static_cast<const AdamW*>(nullptr))` writes version 2 with `optimizer_present` 0 and no optimizer block. `load` in `LoadMode::Resume` restores SGD into `Loaded::optimizer` or AdamW into `Loaded::adamw`, and leaves the other empty. `LoadMode::Inference` leaves both empty. A version-2 kind other than 1 or 2 throws `unsupported optimizer kind N`. `Network::load` accepts version 1 and version 2. A façade file fails that load on parameter count because the trunk has no embeddings.
+`save(path, nullptr)` writes version 1, family 6, no optimizer block, and those parameters, including `tok_emb.weight` and, for learned absolute positions, `pos_emb.weight`. `save(path, sgd)` writes version 2 with `optimizer_present` 1 and optimizer kind `1` (SGD) followed by the SGD body. `save(path, adamw)` writes version 2 with optimizer kind `2` (AdamW) and the AdamW moments. The flattened groups must be `parameters()` in order. `save(path, static_cast<const AdamW*>(nullptr))` writes version 2 with `optimizer_present` 0 and no optimizer block. A projection-bias config writes version 7 instead. `load` in `LoadMode::Resume` restores SGD into `Loaded::optimizer` or AdamW into `Loaded::adamw`, and leaves the other empty. `LoadMode::Inference` leaves both empty. A version-2 kind other than 1 or 2 throws `unsupported optimizer kind N`. `Network::load` accepts versions 1 through 8. A façade file fails that load on parameter count because the trunk has no embeddings.
 
 ### MNIST shapes
 
@@ -677,7 +677,7 @@ The file is little-endian. Sections are padded to 8 bytes. Strings are a `uint32
 
 The file does not contain activation caches, gradients, or workspaces. The next forward rebuilds any scratch from the tensor shapes.
 
-Magic is `0x314E4E43` (`CNN1` on disk). `Network::save` writes version `1` for SGD or no optimizer and version `2` for AdamW. `Transformer::save` writes version `1` for a null `Sgd*` (`nullptr`), version `2` with SGD kind `1`, and version `2` with AdamW kind `2`. A null `AdamW*` is version `2` with no optimizer block. `Network::load` and `Transformer::load` accept version 1 and version 2. Any other version throws `unsupported checkpoint version N`. Version 2 keeps this header. When the optimizer flag is set, the optimizer block starts with `optimizer_kind` (`uint32`, `1` SGD or `2` AdamW). An unknown kind throws `unsupported optimizer kind N`.
+Magic is `0x314E4E43` (`CNN1` on disk). `Network::save` writes version `1` for SGD or no optimizer and version `2` for AdamW. `Transformer::save` writes version `1` for a null `Sgd*` (`nullptr`), version `2` with SGD kind `1`, and version `2` with AdamW kind `2`. A null `AdamW*` is version `2` with no optimizer block. A config whose projection bias differs from `bias` writes version 7 with no optimizer block and version 8 when an optimizer block is written. A null `AdamW*` on that config writes version 7. `Network::load` and `Transformer::load` accept versions 1 through 8. A version outside that range throws `unsupported checkpoint version N`. Version 2 keeps this header. When the optimizer flag is set, the optimizer block starts with `optimizer_kind` (`uint32`, `1` SGD or `2` AdamW). An unknown kind throws `unsupported optimizer kind N`.
 
 ### Header (32 bytes)
 
@@ -691,7 +691,7 @@ Magic is `0x314E4E43` (`CNN1` on disk). `Network::save` writes version `1` for S
 | 24 | `uint32` | `1` when an optimizer block follows, else `0`. |
 | 28 | `uint32` | Reserved. Must be 0. |
 
-A train flag or optimizer flag outside `{0, 1}`, or a non-zero reserved word, throws `bad checkpoint header`. A family outside 1..6 throws `bad checkpoint family`. `Network::load` accepts version 1 and version 2.
+A train flag or optimizer flag outside `{0, 1}`, or a non-zero reserved word, throws `bad checkpoint header`. A family outside 1..6 throws `bad checkpoint family`. `Network::load` accepts versions 1 through 8.
 
 ### Config
 
@@ -707,7 +707,7 @@ ConvResNet: `in_channels`, `in_height`, `in_width`, `stem_channels`, pool kernel
 
 RNN: `input_size`, `output_size`, hidden count `uint32`, then that many widths.
 
-Transformer (`6`): `vocab_size`, `d_model`, `num_heads`, `num_layers`, `d_ff`, `max_seq_len` (`int32`), `dropout` (float32), then `tie_embeddings`, `bias`, `activation`, and `positional` (`uint32`). The two flags are `0` or `1`. `activation` is `1` GELU or `2` SwiGLU. `positional` is `1` learned absolute or `2` RoPE. The same version-1 layout follows: pad to 8 bytes, then parameter records, then a batch-norm count of 0. A RoPE file has no `pos_emb.weight` and no norm bias. A learned-absolute file still has both.
+Transformer (`6`): `vocab_size`, `d_model`, `num_heads`, `num_layers`, `d_ff`, `max_seq_len` (`int32`), `dropout` (float32), then `tie_embeddings`, `bias`, `activation`, and `positional` (`uint32`). The two flags are `0` or `1`. `activation` is `1` GELU or `2` SwiGLU. `positional` is `1` learned absolute or `2` RoPE. The same version-1 layout follows: pad to 8 bytes, then parameter records, then a batch-norm count of 0. A RoPE file has no `pos_emb.weight` and no norm bias. A learned-absolute file still has both. Version 7 appends the version-3 extended tail, then `causal` and `type_vocab_size`, then `qkv_bias`, `attn_out_bias`, `mlp_bias`, `lm_head_bias`, `gelu_tanh`, `rope_dims`, `sliding_window`, `rope_scaling`, three RoPE scale factors, `rope_original_context`, `post_norm`, `embed_norm`, `embed_norm_eps`, `final_norm`, and `mlm_head`. Version 8 is that file with an optimizer block. Versions 1–6 still set every projection bias from `bias`.
 
 `load` runs `validate` on the decoded config and then the same builder that created the network.
 
@@ -755,7 +755,7 @@ Present only when the header flag is 1.
 
 A count or numel mismatch throws `optimizer state mismatch`.
 
-`Transformer::save` with an `Sgd*` writes version `2` and, immediately before this body, a `uint32` kind. Kind `1` is SGD. Kind `2` is AdamW and uses the AdamW payload instead of this body. `Transformer::save` with a null `Sgd*` (`nullptr`) writes version `1` and omits the kind and the body. `Transformer::save` with a null `AdamW*` writes version `2` and omits the kind and the body. `Transformer::load` of version 1 reads this body when the optimizer flag is set, with no kind tag. A kind other than `1` or `2` throws `unsupported optimizer kind N`. Resume of kind `2` fills `Loaded::adamw` and leaves `optimizer` empty. Parameter records in a learned-absolute façade file are `tok_emb.weight`, `pos_emb.weight`, then the trunk names. A RoPE file skips `pos_emb.weight` and every norm bias.
+`Transformer::save` with an `Sgd*` writes version `2` and, immediately before this body, a `uint32` kind. Kind `1` is SGD. Kind `2` is AdamW and uses the AdamW payload instead of this body. `Transformer::save` with a null `Sgd*` (`nullptr`) writes version `1` and omits the kind and the body. `Transformer::save` with a null `AdamW*` writes version `2` and omits the kind and the body, except a projection-bias config, which writes version 7. `Transformer::load` of version 1 reads this body when the optimizer flag is set, with no kind tag. A kind other than `1` or `2` throws `unsupported optimizer kind N`. Resume of kind `2` fills `Loaded::adamw` and leaves `optimizer` empty. Parameter records in a learned-absolute façade file are `tok_emb.weight`, `pos_emb.weight`, then the trunk names. A RoPE file skips `pos_emb.weight` and every norm bias.
 
 An SGD payload in version 2 is that same body, after the kind tag.
 
@@ -767,7 +767,7 @@ An AdamW payload (kind `2`) is `lr`, `beta1`, `beta2`, `eps` (float32), `group_c
 |---|---|
 | Unreadable, shorter than 32 bytes, or cut off mid-record | `truncated checkpoint` |
 | Wrong magic | `bad checkpoint magic` |
-| Version other than 1 or 2 | `unsupported checkpoint version N` |
+| Version outside 1 through 8 | `unsupported checkpoint version N` |
 | Version 2 optimizer kind other than 1 or 2 | `unsupported optimizer kind N` |
 | Bad flag or reserved word | `bad checkpoint header` |
 | Family outside 1..6, or `ConvResNet::load` of another family | `bad checkpoint family` |
@@ -860,6 +860,6 @@ At the start of the ResNet's last epoch the test zeros every `running_mean`, fil
 
 ## Scope
 
-The library is a fixed set of layers with manual backward passes, six builders, one loss, SGD and AdamW, and checkpoint versions 1 and 2. `Network` checkpoints are version 1 for SGD or no optimizer and version 2 for AdamW. A `Transformer` checkpoint is version 1 without an optimizer and version 2 with SGD kind 1. MLP hidden activations are ReLU, GELU, or SwiGLU. A caller changes depth by changing the length of a width or stage vector, and width by changing the integers in that config.
+The library is a fixed set of layers with manual backward passes, six builders, one loss, SGD and AdamW, and checkpoint versions 1 and 2. A transformer whose projection bias differs from `bias` is version 7, or version 8 with an optimizer block. `Network` checkpoints are version 1 for SGD or no optimizer and version 2 for AdamW. A `Transformer` checkpoint is version 1 without an optimizer and version 2 with SGD kind 1. MLP hidden activations are ReLU, GELU, or SwiGLU. A caller changes depth by changing the length of a width or stage vector, and width by changing the integers in that config.
 
 It is built for one process, one GPU, and one stream per context. Networks are MLPs, conv stacks, basic-block ResNets, ConvResNet models that can include a conv trunk, residual stages, or both, Elman RNNs, and a decoder-only transformer trunk of blocks, a final norm, and `lm_head`. That trunk reads a float tensor `(N, T, d_model)`. Conv, ResNet, and ConvResNet builders use ReLU. The training set exercised by the suite is MNIST.
