@@ -2,7 +2,7 @@
 
 This tree is the ROCm implementation of namespace `nn`. Public headers live under `include/nn/` and do not include HIP or hipBLAS headers. The static library target is `nn`. The call contract is [api.md](api.md).
 
-`src/checkpoint.cpp`, `include/nn/transformer.hpp`, and `include/nn/layer.hpp` are the same bytes in `nnCUDA`, `nnCL`, `nnROCm`, and `nnArc`. `include/nn/context.hpp` differs in comments. This tree opens a device with `hipSetDevice`.
+`src/checkpoint.cpp`, `include/nn/transformer.hpp`, and `include/nn/layer.hpp` are the same bytes in `nnCUDA`, `nnCL`, `nnROCm`, and `nnArc`. `include/nn/context.hpp` differs in comments and in how a device is opened. `nnArc` has no `include/nn/dtype.hpp` and no `Context::set_activation_dtype`. This tree opens a device with `hipSetDevice`.
 
 ## Where a call lands
 

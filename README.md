@@ -1,8 +1,8 @@
 # nnROCm
 
-A single-GPU C++17 library that builds and trains multilayer perceptrons, convolutional networks, basic-block ResNets, recurrent networks, and a decoder-only transformer trunk. `ConvResNet` is one network that can include a conv+pool trunk, residual stages, or both. Depth and width come from a config. Each trainable layer implements its own forward and backward pass. The network chains those layers. An MLP selects ReLU, GELU, or SwiGLU between its hidden linear layers. Training uses mean softmax cross-entropy and either SGD with momentum or AdamW. A checkpoint restores parameters, batch-norm state, the train or eval flag, and, when requested, the optimizer, so a new process can evaluate or resume training. `Network::save` writes version 1 for SGD or no optimizer and version 2 for AdamW. `Transformer::save` writes version 1 with no optimizer and version 2 with SGD kind 1.
+A single-GPU C++17 library that builds and trains multilayer perceptrons, convolutional networks, basic-block ResNets, recurrent networks, and a transformer trunk. The trunk is causal unless the config sets bidirectional attention. `ConvResNet` is one network that can include a conv+pool trunk, residual stages, or both. Depth and width come from a config. Each trainable layer implements its own forward and backward pass. The network chains those layers. An MLP selects ReLU, GELU, or SwiGLU between its hidden linear layers. Training uses mean softmax cross-entropy and either SGD with momentum or AdamW. A checkpoint restores parameters, batch-norm state, the train or eval flag, and, when requested, the optimizer, so a new process can evaluate or resume training. `Network::save` writes version 1 for SGD or no optimizer and version 2 for AdamW. `Transformer::save` writes versions 1 through 8. A classic block is version 1 with no optimizer and version 2 with one. A Qwen-style block is version 3 or 4. A bidirectional block or a segment table is version 5 or 6. A projection-bias block is version 7 or 8. The even versions store the optimizer.
 
-This tree is the ROCm build of [nnCUDA](https://github.com/busysteve/nnCUDA). The public API and `src/checkpoint.cpp` match that library and [nnCL](https://github.com/busysteve/nnCL), so a checkpoint written by one loads in the others. The contract is [docs/api.md](docs/api.md). Public headers do not include HIP or hipBLAS headers.
+This tree is the ROCm build of [nnCUDA](https://github.com/busysteve/nnCUDA). The public headers match that library and [nnCL](https://github.com/busysteve/nnCL). [nnArc](https://github.com/busysteve/nnArc) has no `dtype.hpp` and keeps activations in float32. `src/checkpoint.cpp` matches all three, so a checkpoint written by one loads in the others. The contract is [docs/api.md](docs/api.md). Public headers do not include HIP or hipBLAS headers.
 
 nn targets NVIDIA GPUs through CUDA, cuBLAS, and cuDNN. This machine is an AMD Radeon 860M (`gfx1152`, wavefront 32). nnROCm keeps the same one-GPU float32 API and runs the dense algebra in rocBLAS through hipBLAS. Elementwise work, norms, attention softmax, convolution gather, pooling, and batch-norm are HIP kernels sized for a 256-thread workgroup and a 32-wide wave. MIOpen is not required.
 
@@ -13,7 +13,7 @@ The acceptance suite is MNIST. `./build/nn_tests shapes`, `grads`, and `ckpt` ar
 - C++17 and CMake 3.24 or newer
 - ROCm with `amdclang++`, hipBLAS (`roc::hipblas`), and rocBLAS (`roc::rocblas`)
 - One HIP device per `Context`. `Context()` keeps the current device and does not call `hipSetDevice`. `Context(int device)` calls `hipSetDevice`. `detect_devices()` lists the visible devices. `select_device("auto")` and `Context("auto")` use the first. `select_device("1")` and `Context("1")` are manual. `device_count()` is the length of that list. An index outside it, or a choice that is neither `auto` nor a decimal index, throws `device`.
-- float32, NCHW, one non-default stream per `Context`
+- float32 parameters, gradients, and checkpoints. Retained activations are bfloat16 unless `Context::set_activation_dtype(Float32)` selects float32. NCHW. One non-default stream per `Context`
 
 The default offload architecture is `gfx1152` (`CMAKE_HIP_ARCHITECTURES`). Point `CMAKE_HIP_COMPILER` at `amdclang++` when it is not `/opt/rocm/bin/amdclang++`. CMake's HIP language does not accept the `hipcc` wrapper.
 
@@ -233,9 +233,9 @@ classDiagram
 
 ## Data layout and numerics
 
-- Storage is dense float32, little-endian on the host.
-- Rank-2 shape is `(N, F)`, row-major. Rank-4 shape is `(N, C, H, W)`, NCHW.
-- Rank is 1, 2, or 4. Every dimension is at least 1. The element count must fit in a signed 32-bit integer.
+- Parameters, the gradients Adam sees, optimizer state, and checkpoints are dense float32, little-endian on the host. Retained activations are bfloat16 unless `Context::set_activation_dtype(Float32)` selects float32. `to_host()` widens bfloat16 to float.
+- Rank-2 shape is `(N, F)`, row-major. Rank-3 shape is `(N, T, F)`. Rank-4 shape is `(N, C, H, W)`, NCHW.
+- Rank is 1, 2, 3, or 4. Every dimension is at least 1. The element count must fit in a signed 32-bit integer.
 - Linear algebra uses `hipblasGemmEx` and `hipblasGemmStridedBatchedEx` with `HIP_R_32F`, `HIPBLAS_COMPUTE_32F`, and `HIPBLAS_GEMM_DEFAULT`. rocBLAS on this stack rejects `HIPBLAS_COMPUTE_32F_PEDANTIC` and `HIPBLAS_PEDANTIC_MATH`, so those modes are not set. hipBLAS atomics are `HIPBLAS_ATOMICS_NOT_ALLOWED`.
 - A 1×1 convolution with stride 1 and pad 0 is a GEMM on the NCHW planes. Every other convolution is cross-correlation, dilation 1, groups 1: `im2col` into the workspace, then a strided batched GEMM. Images are chunked so the column buffer plus the per-image weight-gradient partials stay inside 64 MiB. One image that does not fit throws `conv workspace <bytes> exceeds 64 MiB budget` with that image's byte count.
 - Spatial size is `(in + 2 * pad - kernel) / stride + 1` using integer division. `conv_out_size` throws `std::invalid_argument` when the result is below 1.
@@ -860,6 +860,6 @@ At the start of the ResNet's last epoch the test zeros every `running_mean`, fil
 
 ## Scope
 
-The library is a fixed set of layers with manual backward passes, six builders, one loss, SGD and AdamW, and checkpoint versions 1 and 2. A transformer whose projection bias differs from `bias` is version 7, or version 8 with an optimizer block. `Network` checkpoints are version 1 for SGD or no optimizer and version 2 for AdamW. A `Transformer` checkpoint is version 1 without an optimizer and version 2 with SGD kind 1. MLP hidden activations are ReLU, GELU, or SwiGLU. A caller changes depth by changing the length of a width or stage vector, and width by changing the integers in that config.
+The library is a fixed set of layers with manual backward passes, six builders, one loss, SGD and AdamW, and checkpoint versions 1 through 8. `Network` checkpoints are version 1 for SGD or no optimizer and version 2 for AdamW. A classic `Transformer` checkpoint is version 1 without an optimizer and version 2 with one. A Qwen-style block is version 3 or 4. A bidirectional block or a segment table is version 5 or 6. A projection-bias block is version 7 or 8. MLP hidden activations are ReLU, GELU, or SwiGLU. A caller changes depth by changing the length of a width or stage vector, and width by changing the integers in that config.
 
-It is built for one process, one GPU, and one stream per context. Networks are MLPs, conv stacks, basic-block ResNets, ConvResNet models that can include a conv trunk, residual stages, or both, Elman RNNs, and a decoder-only transformer trunk of blocks, a final norm, and `lm_head`. That trunk reads a float tensor `(N, T, d_model)`. Conv, ResNet, and ConvResNet builders use ReLU. The training set exercised by the suite is MNIST.
+It is built for one process, one GPU, and one stream per context. Networks are MLPs, conv stacks, basic-block ResNets, ConvResNet models that can include a conv trunk, residual stages, or both, Elman RNNs, and a transformer trunk of blocks, a final norm, and `lm_head`. The trunk is causal unless the config sets bidirectional attention. That trunk reads a float tensor `(N, T, d_model)`. Conv, ResNet, and ConvResNet builders use ReLU. The training set exercised by the suite is MNIST.

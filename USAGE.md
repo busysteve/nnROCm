@@ -1,12 +1,12 @@
 # Usage
 
-This is the programmer's guide for the ROCm tree, nnROCm. The types are the same C++17 API as [nnCUDA](https://github.com/busysteve/nnCUDA) and [nnCL](https://github.com/busysteve/nnCL). Every type lives in a header under `include/nn/`. Those headers are plain C++17. Build steps, numeric details, the checkpoint byte layout, and the MNIST suite are in [README.md](README.md).
+This is the programmer's guide for the ROCm tree, nnROCm. The types match [nnCUDA](https://github.com/busysteve/nnCUDA) and [nnCL](https://github.com/busysteve/nnCL), including bfloat16 activations. [nnArc](https://github.com/busysteve/nnArc) keeps activations in float32 and has no `dtype.hpp`. Every type lives in a header under `include/nn/`. Those headers are plain C++17. Build steps, numeric details, the checkpoint byte layout, and the MNIST suite are in [README.md](README.md).
 
 Link the CMake target `nn`. It carries `roc::hipblas` and `roc::rocblas`. A program that links `libnn.a` by hand also links hipBLAS and rocBLAS.
 
 Create one `Context` on the HIP device you want, then create tensors, layers, and the optimizer from that context. Destroy those objects before the context. The context uses the device that is current when it is constructed, and it owns one stream. `synchronize()` waits for that stream.
 
-Storage is dense float32. A rank-2 tensor is `(N, F)`, row-major. A rank-3 tensor is `(N, T, F)`, with the feature index contiguous. A rank-4 tensor is `(N, C, H, W)`, NCHW. `forward` and `backward` return a `const Tensor&` into storage owned by that layer. The reference stays valid until the next `forward` or `backward` on the same layer, or until the layer is destroyed. Keep values with `to_host()` or `copy_from`.
+Parameters, the gradients Adam sees, optimizer state, and checkpoints are dense float32. Retained activations are bfloat16 unless `Context::set_activation_dtype(Float32)` selects float32. A rank-2 tensor is `(N, F)`, row-major. A rank-3 tensor is `(N, T, F)`, with the feature index contiguous. A rank-4 tensor is `(N, C, H, W)`, NCHW. `forward` and `backward` return a `const Tensor&` into storage owned by that layer. The reference stays valid until the next `forward` or `backward` on the same layer, or until the layer is destroyed. Keep values with `to_host()` or `copy_from`.
 
 `NamedParam` and `NamedBuffer` hold raw pointers into those tensors. `parameters()` and `buffers()` return a fresh vector of pointers. The storage lives as long as the owning layer does. `Sgd` copies the pointers and owns one velocity tensor per parameter. `AdamW` copies them in groups and owns a first and second moment per parameter.
 
@@ -71,6 +71,8 @@ class Context {
   explicit Context(int device);
   explicit Context(const std::string& choice);
   void synchronize() const;
+  void set_activation_dtype(DType dtype);
+  DType activation_dtype() const;
 };
 
 struct DeviceInfo {
@@ -86,6 +88,8 @@ int select_device(const std::string& choice);
 
 `Context` is neither copyable nor movable. `Context()` creates the stream and the hipBLAS handle on the current device and does not call `hipSetDevice`. `Context(int device)` calls `hipSetDevice` first. `device_count()` is the number of visible HIP devices, and `device_name` is that device's name. An index outside `0 .. device_count()-1` throws `device`. `detect_devices()` returns those devices in index order. `select_device("auto")` is the first one. `select_device("1")` is manual. `Context(choice)` uses that result and calls `hipSetDevice`. A blank choice, a word other than `auto`, or an index past the list throws `device`. Pass the same `Context&` to every tensor, label buffer, layer, and loss that must share that stream. `data()` is a HIP device pointer.
 
+`set_activation_dtype` accepts `Float32` or `BFloat16` and throws `dtype` otherwise. The default is `BFloat16`. It selects the storage of retained activations. Parameters, the gradients Adam sees, and checkpoints stay float32. Call it before creating tensors or layers. `DType` is declared in `nn/dtype.hpp`. `nnArc` has no such call. Its activations stay float32.
+
 `synchronize()` waits until work queued on that stream has finished. `Tensor::to_host()`, `kaiming_normal`, and `normal_` synchronize for you. `copy_from_host` queues an async copy, so call `synchronize()` before reusing the host buffer.
 
 ## Tensor
@@ -96,12 +100,17 @@ Header: `nn/tensor.hpp`
 class Tensor {
  public:
   Tensor(Context& ctx, std::vector<int> shape);
+  Tensor(Context& ctx, std::vector<int> shape, DType dtype);
   Context& context() const;
   int rank() const;
   const std::vector<int>& shape() const;
   int64_t numel() const;
+  DType dtype() const;
+  size_t bytes() const;
   float* data();
   const float* data() const;
+  uint16_t* bf16_data();
+  const uint16_t* bf16_data() const;
 
   void zero();
   void fill(float value);
@@ -114,15 +123,15 @@ class Tensor {
 };
 ```
 
-`Tensor` is movable and not copyable. The constructor allocates device memory with `hipMalloc`. Fresh memory is uninitialized. Call `zero`, `fill`, or `copy_from_host` before a read.
+`Tensor` is movable and not copyable. `Tensor(ctx, shape)` is float32. `Tensor(ctx, shape, dtype)` selects the storage. The constructor allocates device memory with `hipMalloc`. Fresh memory is uninitialized. Call `zero`, `fill`, or `copy_from_host` before a read.
 
 The shape has rank 1, 2, 3, or 4. Every dimension is at least 1. The element count must fit in a signed 32-bit integer. A bad rank throws `tensor rank out of range`. A bad dimension throws `tensor dimension out of range`. An overflowing product throws `tensor numel out of range`.
 
-`data()` is a device pointer. Kernels that use it run on `context()`'s stream.
+`data()` is the float32 device pointer and throws `tensor dtype` when the tensor is bfloat16. `bf16_data()` is the bfloat16 pointer and throws `tensor dtype` when the tensor is float32. Kernels that use the pointer run on `context()`'s stream.
 
-`copy_from` requires the same element count and throws `tensor copy numel mismatch` otherwise. A source on another context is synchronized before the copy. `copy_from_host` throws `tensor host copy numel mismatch` when `n` or `src.size()` differs from `numel()`.
+`copy_from` requires the same element count and throws `tensor copy numel mismatch` otherwise. It converts when the dtypes differ. A source on another context is synchronized before the copy. `copy_from_host` throws `tensor host copy numel mismatch` when `n` or `src.size()` differs from `numel()`.
 
-`to_host()` synchronizes, then copies the tensor to a `std::vector<float>`.
+`to_host()` synchronizes, then returns a `std::vector<float>`. Bfloat16 values are widened to float.
 
 `scale(factor)` multiplies every element in place on the context stream. It does not synchronize.
 
